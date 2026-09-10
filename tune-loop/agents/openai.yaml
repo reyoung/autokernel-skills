@@ -1,0 +1,3 @@
+interface:
+  display_name: "Tune Loop"
+  short_description: "执行 CUDA kernel 调优循环，验证候选、评测性能并记录尝试结果"

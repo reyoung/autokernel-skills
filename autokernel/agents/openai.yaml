@@ -1,0 +1,3 @@
+interface:
+  display_name: "AutoKernel"
+  short_description: "组织 kernel 自动优化流程，串联基线、候选验证、性能评测和调优记录"
