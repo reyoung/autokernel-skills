@@ -33,3 +33,5 @@ description: "与用户确定代码优化 baseline 的指标、正确性判据�
 ## 生成与交付
 
 用户确认方案后，按项目惯例生成并检查脚本及必要配置，依据 [schema](scripts/baseline_meta.schema.json) 生成 `.autokernel/baseline_meta.json`，使用 [检查脚本](scripts/validate_baseline_meta.py) 校验后交付。元信息格式参考 [示例](scripts/baseline_meta.example.json)。
+
+`metrics.benchmark` 须覆盖用户声明的优化目标（名称、单位、direction）；后续 `init-workspace` 从中选出本次监控的子集并写入 workspace 的 `target-metric.json`。verify 指标用于正确性，不进入帕累托监控集合，除非用户明确要求。

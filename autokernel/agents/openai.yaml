@@ -1,0 +1,3 @@
+interface:
+  display_name: "AutoKernel"
+  short_description: "组织 kernel 自动优化：基线、参考选型、target-metric 与调优循环"
