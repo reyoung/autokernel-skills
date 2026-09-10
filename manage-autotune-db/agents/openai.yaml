@@ -1,3 +1,0 @@
-interface:
-  display_name: "管理 Autotune 数据库"
-  short_description: "生成和检测 autotune 数据库，校验并插入新的调优数据"
