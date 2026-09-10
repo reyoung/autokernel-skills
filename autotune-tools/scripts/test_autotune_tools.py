@@ -56,9 +56,9 @@ class RepositoryTestCase(unittest.TestCase):
         self.git("-C", repo, "commit", "-m", "initial")
         return repo
 
-    def init(self, refs=()):
+    def init(self, refs=(), user_prompt="优化 kernel 的性能，保持正确性。"):
         with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-            INIT(self.repo, self.workspace, refs)
+            INIT(self.repo, self.workspace, refs, user_prompt)
 
     def worktrees(self):
         return self.git("-C", self.repo, "worktree", "list", "--porcelain")
@@ -184,9 +184,31 @@ class WorkspaceTests(RepositoryTestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("init-workspace", result.stdout)
         result = subprocess.run([str(CLI), "init-workspace", str(self.root / "missing"),
-                                 str(self.workspace)], capture_output=True, text=True)
+                                 str(self.workspace)], input="test", capture_output=True, text=True)
         self.assertEqual(result.returncode, 1)
         self.assertFalse(self.workspace.exists())
+
+    def test_initialization_saves_user_prompt_verbatim(self):
+        prompt = "  优化 CUDA kernel\r\n约束：保持正确性，目标加速 2 倍。\n\n" * 10000
+        result = subprocess.run(
+            [str(CLI), "init-workspace", str(self.repo), str(self.workspace)],
+            input=prompt.encode("utf-8"), capture_output=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.workspace / "user_prompt.md").read_bytes(), prompt.encode("utf-8"))
+
+    def test_user_prompt_is_required_and_nonblank(self):
+        for prompt in ("", " \t\n"):
+            with self.subTest(prompt=prompt):
+                result = subprocess.run(
+                    [str(CLI), "init-workspace", str(self.repo), str(self.workspace)],
+                    input=prompt, capture_output=True, text=True,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("stdin", result.stderr)
+                self.assertFalse(self.workspace.exists())
+        with self.assertRaises(ValueError):
+            self.init(user_prompt="")
 
 
 class InitializedWorkspaceTestCase(RepositoryTestCase):
@@ -368,12 +390,14 @@ class AttemptTests(InitializedWorkspaceTestCase):
         other = self.root / "other-workspace"
         other.mkdir()
         with LOCK(other):
-            process = self.start_waiting_cli(["init-workspace", str(self.repo), str(other)])
+            process = self.start_waiting_cli(["init-workspace", str(self.repo), str(other)],
+                                             plan=b"original prompt")
             self.assertIsNone(process.poll())
             self.assertEqual([p.name for p in other.iterdir()], [".autotune.lock"])
         _, stderr = process.communicate(timeout=10)
         self.assertEqual(process.returncode, 0, stderr)
         self.assertTrue((other / "autotune.db").is_file())
+        self.assertEqual((other / "user_prompt.md").read_text(), "original prompt")
 
 
 class CompletionTests(InitializedWorkspaceTestCase):

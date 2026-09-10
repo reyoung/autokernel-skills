@@ -116,7 +116,9 @@ def download_references(references, root):
         raise RuntimeError("参考仓库初始化失败:\n" + "\n".join(errors))
 
 
-def init_workspace(repo, workspace, references):
+def init_workspace(repo, workspace, references, user_prompt):
+    if not user_prompt.strip():
+        raise ValueError("stdin 中的用户原始请求不能为空或仅包含空白。")
     repo = Path(repo).resolve()
     workspace = Path(workspace).absolute()
     if not repo.is_dir():
@@ -139,6 +141,7 @@ def init_workspace(repo, workspace, references):
         baseline = workspace / "baseline"
         best = workspace / "best"
         try:
+            (workspace / "user_prompt.md").write_bytes(user_prompt.encode("utf-8"))
             baseline.write_text(commit + "\n", encoding="ascii")
             git("-C", repo, "worktree", "add", "--detach", best, commit)
             create_database(workspace / "autotune.db")
@@ -154,7 +157,7 @@ def init_workspace(repo, workspace, references):
                       file=sys.stderr)
                 raise
             try:
-                for name in ("baseline", "best", "autotune.db", "reference", "attempts"):
+                for name in ("user_prompt.md", "baseline", "best", "autotune.db", "reference", "attempts"):
                     path = workspace / name
                     if path.is_symlink() or path.is_file():
                         path.unlink()
@@ -394,7 +397,10 @@ def complete_attempt(workspace, attempt_id, metrics, summary, details, fail=Fals
 def main():
     parser = argparse.ArgumentParser(prog="autotune-tools", description="管理 autotune workspace。")
     commands = parser.add_subparsers(dest="command")
-    init = commands.add_parser("init-workspace", help="从本地仓库 HEAD 初始化 workspace")
+    init = commands.add_parser(
+        "init-workspace", help="从本地仓库 HEAD 初始化 workspace，从 stdin 读取用户原始请求",
+        description="从 stdin 读取完整 UTF-8 用户原始请求，不能为空或仅包含空白；原样保存到 user_prompt.md。",
+    )
     init.add_argument("repo", help="本地 Git 仓库；不包含未提交修改")
     init.add_argument("workspace", help="不存在、为空或仅含 .autotune.lock 的 workspace 目录")
     init.add_argument("--ref", nargs=3, action="append", default=[],
@@ -421,7 +427,8 @@ def main():
         return 0
     try:
         if args.command == "init-workspace":
-            init_workspace(args.repo, args.workspace, args.ref)
+            user_prompt = sys.stdin.buffer.read().decode("utf-8")
+            init_workspace(args.repo, args.workspace, args.ref, user_prompt)
         elif args.command == "new-attempt":
             plan = sys.stdin.buffer.read().decode("utf-8")
             new_attempt(args.workspace, plan)
