@@ -42,7 +42,7 @@ workspace/
 - autotune.db 由 autotune-tools 管理，记录每次尝试的状态、指标、总结、详情和提交 SHA。
 - baseline 只记录最初的 commit SHA，后续合入不修改它。
 - best 从用户的本地仓库创建，初始 HEAD 等于 baseline。它始终是同一个 worktree；每个被接受的 Attempt 向它增加一个 squash commit。
-- reference 存放参考项目，通过 `autotune-tools` 的多个 `--ref` 参数并行、递归下载。
+- reference 存放参考项目，通过 `autotune-tools` 的多个 `--ref` 参数并行、递归下载；`README.md` 由初始化流程按入选项目填写简介。
 - attempts 保存各次计划、验证结果和候选 worktree；完成后保留候选原有提交用于追溯。`BaseCommitSHA` 记录创建时的 best HEAD。
 
 
