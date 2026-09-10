@@ -1,0 +1,142 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Baseline script metadata v1",
+  "description": "描述生成的 verify/benchmark 脚本接口、指标和保护文件清单。命令为 argv 数组，从目标项目根目录调用。",
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "protected_files": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/protectedFile"
+      },
+      "description": "需要由后续工具保护的文件及其 checksum。包含 verify/benchmark 脚本，以及它们依赖的测试数据、参考实现、输入生成代码和评测配置等文件；同一文件只列一次。"
+    },
+    "evaluation": {
+      "type": "object",
+      "properties": {
+        "verify": {
+          "$ref": "#/$defs/runner"
+        },
+        "benchmark": {
+          "$ref": "#/$defs/runner"
+        }
+      },
+      "required": [
+        "verify",
+        "benchmark"
+      ],
+      "additionalProperties": false
+    },
+    "metrics": {
+      "type": "object",
+      "properties": {
+        "verify": {
+          "$ref": "#/$defs/metrics"
+        },
+        "benchmark": {
+          "$ref": "#/$defs/metrics"
+        }
+      },
+      "required": [
+        "verify",
+        "benchmark"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "required": [
+    "schema_version",
+    "protected_files",
+    "evaluation",
+    "metrics"
+  ],
+  "additionalProperties": false,
+  "$defs": {
+    "protectedFile": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "$ref": "#/$defs/text",
+          "description": "相对于目标项目根目录的文件路径，使用 / 分隔。"
+        },
+        "checksum": {
+          "type": "string",
+          "minLength": 64,
+          "maxLength": 64,
+          "pattern": "^[0-9a-f]{64}$",
+          "description": "生成完成后文件原始字节的 SHA-256，小写十六进制，不带前缀。生成元信息时从实际文件计算；元信息检查仅校验格式，内容复核由后续工具负责。"
+        }
+      },
+      "required": [
+        "path",
+        "checksum"
+      ],
+      "additionalProperties": false
+    },
+    "text": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "\\S"
+    },
+    "runner": {
+      "type": "object",
+      "properties": {
+        "script": {
+          "$ref": "#/$defs/text",
+          "description": "相对于目标项目根目录的脚本路径，使用 / 分隔。"
+        },
+        "command": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/text"
+          },
+          "description": "调用该评测方面的 argv；同脚本多模式时包含模式参数。"
+        }
+      },
+      "required": [
+        "script",
+        "command"
+      ],
+      "additionalProperties": false
+    },
+    "metrics": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": {
+        "$ref": "#/$defs/text"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/metric"
+      },
+      "description": "以 metric 名称为键，支持一个或多个指标；名称与脚本输出中的指标名称一致。"
+    },
+    "metric": {
+      "type": "object",
+      "properties": {
+        "unit": {
+          "$ref": "#/$defs/text",
+          "description": "指标单位，如 ms、records/s；无量纲使用 1，布尔指标使用 bool。"
+        },
+        "direction": {
+          "type": "string",
+          "enum": [
+            "minimize",
+            "maximize"
+          ],
+          "description": "minimize 表示越小越好，maximize 表示越大越好；每个指标独立指定。"
+        }
+      },
+      "required": [
+        "unit",
+        "direction"
+      ],
+      "additionalProperties": false
+    }
+  }
+}

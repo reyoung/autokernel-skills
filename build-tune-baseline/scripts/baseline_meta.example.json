@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "protected_files": [
+    {
+      "path": "eval/evaluate.py",
+      "checksum": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "path": "eval/reference.py",
+      "checksum": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "path": "eval/data/inputs.json",
+      "checksum": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "path": "eval/config.json",
+      "checksum": "0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  ],
+  "evaluation": {
+    "verify": {
+      "script": "eval/evaluate.py",
+      "command": [
+        "python3",
+        "eval/evaluate.py",
+        "--mode",
+        "verify"
+      ]
+    },
+    "benchmark": {
+      "script": "eval/evaluate.py",
+      "command": [
+        "python3",
+        "eval/evaluate.py",
+        "--mode",
+        "benchmark"
+      ]
+    }
+  },
+  "metrics": {
+    "verify": {
+      "max_abs_error": {
+        "unit": "1",
+        "direction": "minimize"
+      },
+      "shape_matches": {
+        "unit": "bool",
+        "direction": "maximize"
+      }
+    },
+    "benchmark": {
+      "latency_ms": {
+        "unit": "ms",
+        "direction": "minimize"
+      },
+      "throughput_records_per_second": {
+        "unit": "records/s",
+        "direction": "maximize"
+      }
+    }
+  }
+}
