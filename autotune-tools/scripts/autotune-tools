@@ -5,12 +5,15 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import closing, contextmanager
 import fcntl
+import json
+import math
 import os
 from pathlib import Path
 import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 
 
 def git(*args):
@@ -58,11 +61,15 @@ def create_database(path):
             CREATE TABLE Attempts (
                 ID INTEGER PRIMARY KEY AUTOINCREMENT,
                 Plan TEXT,
-                Status TEXT CHECK (Status IN ('running', 'completed', 'failed')),
+                Status TEXT NOT NULL CHECK (Status IN ('running', 'completed', 'failed')),
+                BaseCommitSHA TEXT NOT NULL,
+                SquashCommitSHA TEXT,
                 Summary TEXT,
                 Details TEXT,
                 CreatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                UpdatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                UpdatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                CHECK ((Status = 'completed' AND SquashCommitSHA IS NOT NULL)
+                    OR (Status != 'completed' AND SquashCommitSHA IS NULL))
             );
             CREATE TABLE Metrics (
                 ID INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -130,9 +137,10 @@ def init_workspace(repo, workspace, references):
     with workspace_lock(workspace):
         check_empty_workspace(workspace)
         baseline = workspace / "baseline"
+        best = workspace / "best"
         try:
-            git("-C", repo, "worktree", "add", "--detach", baseline, commit)
-            (workspace / "best").symlink_to("baseline", target_is_directory=True)
+            baseline.write_text(commit + "\n", encoding="ascii")
+            git("-C", repo, "worktree", "add", "--detach", best, commit)
             create_database(workspace / "autotune.db")
             (workspace / "reference").mkdir()
             (workspace / "attempts").mkdir()
@@ -140,7 +148,7 @@ def init_workspace(repo, workspace, references):
         except BaseException:
             # The executor has finished before cleanup, so no clone can recreate files.
             try:
-                remove_worktree(repo, baseline)
+                remove_worktree(repo, best)
             except (OSError, RuntimeError) as error:
                 print(f"清理 worktree 失败，保留 workspace {workspace}: {error}",
                       file=sys.stderr)
@@ -158,56 +166,229 @@ def init_workspace(repo, workspace, references):
     print(f"Workspace 初始化完成: {workspace}")
 
 
-def new_attempt(workspace, plan):
-    if not plan.strip():
-        raise ValueError("plan 不能为空或仅包含空白。")
+def check_worktree(path, label):
+    if path.is_symlink() or not path.is_dir():
+        raise ValueError(f"{label} 必须是 Git worktree 目录: {path}")
+    top = Path(git("-C", path, "rev-parse", "--show-toplevel")).resolve()
+    if top != path:
+        raise ValueError(f"{label} 必须是 Git worktree 根目录: {path}")
+
+
+def require_clean(path, label):
+    if git("-C", path, "status", "--porcelain", "--untracked-files=all",
+           "--ignore-submodules=none"):
+        raise ValueError(f"{label} 含有未提交或未跟踪的修改，请先提交或清理: {path}")
+
+
+@contextmanager
+def open_workspace(workspace):
+    """Validate the current layout and keep all reads/writes under its lock."""
     workspace = Path(workspace).resolve()
     if not workspace.is_dir():
         raise ValueError(f"workspace 目录不存在: {workspace}")
     with workspace_lock(workspace):
         database = workspace / "autotune.db"
+        baseline = workspace / "baseline"
         attempts = workspace / "attempts"
-        best_link = workspace / "best"
+        best = workspace / "best"
+        if baseline.is_dir() or best.is_symlink():
+            raise ValueError("旧版 workspace 布局不再支持，请使用 init-workspace 创建新的 workspace。")
         if (not database.is_file() or database.is_symlink()
+                or not baseline.is_file() or baseline.is_symlink()
                 or not attempts.is_dir() or attempts.is_symlink()
-                or not best_link.is_symlink()):
-            raise ValueError(f"无效的 workspace（需要 autotune.db、attempts/ 和 best 软链接）: {workspace}")
-        best = best_link.resolve(strict=True)
-        top = Path(git("-C", best, "rev-parse", "--show-toplevel")).resolve()
-        if top != best:
-            raise ValueError(f"best 必须指向 Git worktree 根目录: {best}")
-        if git("-C", best, "status", "--porcelain", "--untracked-files=all",
-               "--ignore-submodules=none"):
-            raise ValueError(f"best 含有未提交或未跟踪的修改，请先提交或清理: {best}")
-        commit = git("-C", best, "rev-parse", "--verify", "HEAD^{commit}")
+                or not best.is_dir()):
+            raise ValueError(f"无效的 workspace（需要数据库、baseline SHA 文件、best worktree 和 attempts/）: {workspace}")
+        check_worktree(best, "best")
+        baseline_sha = baseline.read_text(encoding="ascii").strip()
+        resolved = git("-C", best, "rev-parse", "--verify", "--end-of-options",
+                       f"{baseline_sha}^{{commit}}")
+        if resolved != baseline_sha:
+            raise ValueError(f"baseline 必须记录完整 commit SHA: {baseline}")
         with closing(sqlite3.connect(database.as_uri() + "?mode=rw", uri=True)) as db:
             db.execute("PRAGMA foreign_keys = ON")
-            db.execute("BEGIN IMMEDIATE")
-            created = False
-            attempt = None
+            columns = {row[1] for row in db.execute("PRAGMA table_info(Attempts)")}
+            if not {"BaseCommitSHA", "SquashCommitSHA"} <= columns:
+                raise ValueError("旧版或无效的数据库，请使用 init-workspace 创建新的 workspace。")
+            yield workspace, best, db
+
+
+def new_attempt(workspace, plan):
+    if not plan.strip():
+        raise ValueError("plan 不能为空或仅包含空白。")
+    with open_workspace(workspace) as (workspace, best, db):
+        require_clean(best, "best")
+        commit = git("-C", best, "rev-parse", "--verify", "HEAD^{commit}")
+        db.execute("BEGIN IMMEDIATE")
+        created = False
+        attempt = None
+        try:
+            cursor = db.execute(
+                "INSERT INTO Attempts (Plan, Status, BaseCommitSHA) VALUES (?, 'running', ?)",
+                (plan, commit),
+            )
+            attempt_id = cursor.lastrowid
+            attempt = workspace / "attempts" / f"attempt-{attempt_id:05d}"
+            attempt.mkdir()
+            created = True
+            (attempt / "plan.md").write_bytes(plan.encode("utf-8"))
+            git("-C", best, "worktree", "add", "--detach", attempt / "repo", commit)
+            db.commit()
+        except BaseException:
             try:
-                cursor = db.execute(
-                    "INSERT INTO Attempts (Plan, Status) VALUES (?, 'running')", (plan,)
-                )
-                attempt_id = cursor.lastrowid
-                attempt = attempts / f"attempt-{attempt_id:05d}"
-                attempt.mkdir()
-                created = True
-                (attempt / "plan.md").write_bytes(plan.encode("utf-8"))
-                git("-C", best, "worktree", "add", "--detach", attempt / "repo", commit)
-                db.commit()
-            except BaseException:
-                try:
-                    db.rollback()
-                finally:
-                    if created:
-                        try:
-                            remove_worktree(best, attempt / "repo")
-                            shutil.rmtree(attempt)
-                        except (OSError, RuntimeError) as error:
-                            print(f"清理失败，残留位置 {attempt}: {error}", file=sys.stderr)
-                raise
+                db.rollback()
+            finally:
+                if created:
+                    try:
+                        remove_worktree(best, attempt / "repo")
+                        shutil.rmtree(attempt)
+                    except (OSError, RuntimeError) as error:
+                        print(f"清理失败，残留位置 {attempt}: {error}", file=sys.stderr)
+            raise
     print(f"Attempt {attempt_id} 创建完成: {attempt}")
+
+
+def validate_metrics(metrics):
+    if not isinstance(metrics, dict) or not metrics:
+        raise ValueError("--metric 必须是非空 JSON 对象，值为有限数值。")
+    for name, value in metrics.items():
+        try:
+            valid = (isinstance(name, str) and bool(name.strip())
+                     and type(value) in (int, float) and math.isfinite(value))
+        except OverflowError:
+            valid = False
+        if not valid:
+            raise ValueError(f"无效的 metric {name!r}：名称不能为空，值必须是有限数值。")
+
+
+def parse_metrics(text):
+    def unique_keys(pairs):
+        result = {}
+        for name, value in pairs:
+            if name in result:
+                raise ValueError(f"重复的 metric 名称: {name}")
+            result[name] = value
+        return result
+
+    metrics = json.loads(text, object_pairs_hook=unique_keys)
+    validate_metrics(metrics)
+    return metrics
+
+
+def replace_file(path, content, mode=0o644):
+    """Publish a complete file via rename; never expose a partial write."""
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(content)
+            os.fchmod(stream.fileno(), mode)
+        os.replace(temporary, path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
+def complete_attempt(workspace, attempt_id, metrics, summary, details, fail=False):
+    if attempt_id < 1:
+        raise ValueError("Attempt ID 必须为正整数。")
+    validate_metrics(metrics)
+    if not summary.strip():
+        raise ValueError("--summary 不能为空或仅包含空白。")
+    with open_workspace(workspace) as (workspace, best, db):
+        db.execute("BEGIN IMMEDIATE")
+        modified = False
+        originals = {}
+        results_started = False
+        try:
+            row = db.execute(
+                "SELECT Status, BaseCommitSHA FROM Attempts WHERE ID = ?", (attempt_id,)
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"Attempt {attempt_id} 不存在。")
+            status, base = row
+            if status != "running":
+                raise ValueError(f"Attempt {attempt_id} 状态为 {status}，仅 running 可以结束。")
+            attempt = workspace / "attempts" / f"attempt-{attempt_id:05d}"
+            if attempt.is_symlink() or not attempt.is_dir():
+                raise ValueError(f"Attempt 必须是已有的普通目录: {attempt}")
+            for name in ("result.json", "result.md"):
+                path = attempt / name
+                if path.is_symlink() or (path.exists() and not path.is_file()):
+                    raise ValueError(f"结果路径必须是普通文件: {path}")
+                originals[path] = ((path.read_bytes(), path.stat().st_mode & 0o777)
+                                   if path.exists() else None)
+            squash = None
+            if not fail:
+                repo = attempt / "repo"
+                check_worktree(repo, "Attempt repo")
+                # A same-looking commit in a separate repository is not this workspace's worktree.
+                common_args = ("rev-parse", "--path-format=absolute", "--git-common-dir")
+                if git("-C", repo, *common_args) != git("-C", best, *common_args):
+                    raise ValueError("Attempt repo 和 best 必须属于同一 Git 仓库。")
+                require_clean(best, "best")
+                require_clean(repo, "Attempt repo")
+                previous = git("-C", best, "rev-parse", "HEAD")
+                if previous != base:
+                    raise ValueError("best 已改变，请从当前 best 新建 Attempt 并重新验证后合入。")
+                head = git("-C", repo, "rev-parse", "HEAD")
+                git("-C", repo, "merge-base", "--is-ancestor", base, head)
+                if git("-C", repo, "rev-parse", f"{head}^{{tree}}") == git(
+                    "-C", best, "rev-parse", f"{previous}^{{tree}}"
+                ):
+                    raise ValueError("Attempt 没有可合入的修改。")
+                modified = True
+                git("-C", best, "merge", "--squash", "--no-commit", "--no-overwrite-ignore", head)
+                git("-C", best, "commit", "-m", f"autotune: complete attempt-{attempt_id:05d}")
+                squash = git("-C", best, "rev-parse", "HEAD")
+                if (git("-C", best, "rev-list", "--parents", "-n", "1", squash)
+                        != f"{squash} {previous}"
+                        or git("-C", best, "rev-parse", f"{squash}^{{tree}}")
+                        != git("-C", repo, "rev-parse", f"{head}^{{tree}}")):
+                    raise RuntimeError("squash 提交的父提交或文件内容不符合预期。")
+                require_clean(best, "best")
+            status = "failed" if fail else "completed"
+            db.execute(
+                "UPDATE Attempts SET Status = ?, SquashCommitSHA = ?, "
+                "Summary = ?, Details = ?, UpdatedAt = CURRENT_TIMESTAMP WHERE ID = ?",
+                (status, squash, summary, details, attempt_id),
+            )
+            # Final metrics replace any provisional measurements for this Attempt.
+            db.execute("DELETE FROM Metrics WHERE AttemptID = ?", (attempt_id,))
+            db.executemany(
+                "INSERT INTO Metrics (AttemptID, Name, Value) VALUES (?, ?, ?)",
+                [(attempt_id, name, float(value)) for name, value in metrics.items()],
+            )
+            result = {
+                "status": status, "metrics": metrics, "summary": summary, "details": details,
+                "squash_commit_sha": squash,
+            }
+            results_started = True
+            replace_file(attempt / "result.json",
+                         (json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False) + "\n").encode("utf-8"))
+            replace_file(attempt / "result.md",
+                         f"# Summary\n\n{summary}\n\n# Details\n\n{details}".encode("utf-8"))
+            db.commit()
+        except BaseException:
+            try:
+                db.rollback()
+            finally:
+                if results_started:
+                    for path, original in originals.items():
+                        try:
+                            if original is None:
+                                path.unlink(missing_ok=True)
+                            else:
+                                replace_file(path, *original)
+                        except OSError as error:
+                            print(f"恢复结果文件失败: {path}: {error}", file=sys.stderr)
+                if modified:
+                    try:
+                        git("-C", best, "reset", "--hard", previous)
+                    except (OSError, RuntimeError) as error:
+                        print(f"恢复 best 失败: {best}，原 commit: {previous}: {error}", file=sys.stderr)
+            raise
+    if fail:
+        print(f"Attempt {attempt_id} 已记录为 failed: {attempt}")
+    else:
+        print(f"Attempt {attempt_id} 已合入 best: {squash}")
 
 
 def main():
@@ -224,6 +405,16 @@ def main():
         description="从 stdin 读取完整 plan 后等待 workspace 排他锁，再创建 Attempt。",
     )
     attempt.add_argument("workspace", help="已初始化的 workspace 目录")
+    complete = commands.add_parser(
+        "complete-attempt", help="记录 Attempt 结果；默认成功并 squash，--fail 仅记录失败",
+        description="从 stdin 读取 UTF-8 detail 后获取 workspace 文件锁，写入数据库和 result.json/result.md。默认成功：要求双方干净且 best 未改变，并 squash 合入。--fail：仅记录失败，允许 best 已前进或 repo 有未提交修改。",
+    )
+    complete.add_argument("workspace", help="已初始化的 workspace 目录")
+    complete.add_argument("attempt_id", type=int, help="要结束的 running Attempt ID")
+    complete.add_argument("--metric", required=True, metavar="JSON",
+                          help='指标名称到有限数值的非空 JSON 对象，例如 {"latency": 12, "throughput": 56}')
+    complete.add_argument("--summary", required=True, help="非空的总结文本（不能仅包含空白）")
+    complete.add_argument("--fail", action="store_true", help="记录 failed，不 squash，也不检查 best 是否仍为起始 HEAD")
     args = parser.parse_args()
     if args.command is None:
         parser.print_help()
@@ -234,6 +425,12 @@ def main():
         elif args.command == "new-attempt":
             plan = sys.stdin.buffer.read().decode("utf-8")
             new_attempt(args.workspace, plan)
+        elif args.command == "complete-attempt":
+            metrics = parse_metrics(args.metric)
+            if not args.summary.strip():
+                raise ValueError("--summary 不能为空或仅包含空白。")
+            details = sys.stdin.buffer.read().decode("utf-8")
+            complete_attempt(args.workspace, args.attempt_id, metrics, args.summary, details, fail=args.fail)
     except (OSError, ValueError, RuntimeError, sqlite3.Error) as error:
         print(f"错误: {error}", file=sys.stderr)
         return 1

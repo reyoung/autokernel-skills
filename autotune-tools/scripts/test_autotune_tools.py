@@ -2,6 +2,7 @@
 
 from contextlib import redirect_stdout, redirect_stderr
 import io
+import json
 import fcntl
 import signal
 import sys
@@ -22,6 +23,7 @@ INIT = MODULE["init_workspace"]
 DOWNLOAD = MODULE["download_references"]
 NEW = MODULE["new_attempt"]
 LOCK = MODULE["workspace_lock"]
+COMPLETE = MODULE["complete_attempt"]
 
 
 class RepositoryTestCase(unittest.TestCase):
@@ -69,11 +71,14 @@ class WorkspaceTests(RepositoryTestCase):
         (self.repo / "untracked").write_text("untracked")
         before = self.git("-C", self.repo, "status", "--porcelain")
         self.init()
-        self.assertEqual((self.workspace / "baseline/content").read_text(), "source")
-        self.assertFalse((self.workspace / "baseline/untracked").exists())
-        self.assertEqual(os.readlink(self.workspace / "best"), "baseline")
-        self.assertEqual(self.git("-C", self.workspace / "baseline", "rev-parse", "HEAD"),
+        self.assertEqual((self.workspace / "best/content").read_text(), "source")
+        self.assertFalse((self.workspace / "best/untracked").exists())
+        self.assertTrue((self.workspace / "best").is_dir())
+        self.assertFalse((self.workspace / "best").is_symlink())
+        self.assertEqual(self.git("-C", self.workspace / "best", "rev-parse", "HEAD"),
                          self.git("-C", self.repo, "rev-parse", "HEAD"))
+        self.assertEqual((self.workspace / "baseline").read_text(),
+                         self.git("-C", self.repo, "rev-parse", "HEAD") + "\n")
         self.assertEqual(before, self.git("-C", self.repo, "status", "--porcelain"))
         self.assertTrue((self.workspace / "attempts").is_dir())
         self.assertTrue((self.workspace / "reference").is_dir())
@@ -81,7 +86,8 @@ class WorkspaceTests(RepositoryTestCase):
             self.assertEqual(db.execute("SELECT COUNT(*) FROM Attempts").fetchone(), (0,))
             self.assertEqual(db.execute("SELECT COUNT(*) FROM Metrics").fetchone(), (0,))
             db.execute("PRAGMA foreign_keys = ON")
-            db.execute("INSERT INTO Attempts (Plan, Status) VALUES ('plan', 'running')")
+            db.execute("INSERT INTO Attempts (Plan, Status, BaseCommitSHA) VALUES ('plan', 'running', ?)",
+                       (self.git("-C", self.repo, "rev-parse", "HEAD"),))
             db.execute("INSERT INTO Metrics (AttemptID, Name, Value) VALUES (1, 'latency', 1.5)")
             with self.assertRaises(sqlite3.IntegrityError):
                 db.execute("INSERT INTO Metrics (AttemptID) VALUES (99)")
@@ -183,7 +189,7 @@ class WorkspaceTests(RepositoryTestCase):
         self.assertFalse(self.workspace.exists())
 
 
-class AttemptTests(RepositoryTestCase):
+class InitializedWorkspaceTestCase(RepositoryTestCase):
     def setUp(self):
         super().setUp()
         self.init()
@@ -196,6 +202,38 @@ class AttemptTests(RepositoryTestCase):
         with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
             NEW(self.workspace, plan)
 
+    def start_waiting_cli(self, args, plan=b"plan\n"):
+        # Announce immediately before the real flock call: no timing-based guesses.
+        driver = r"""
+import fcntl, runpy, sys
+module = runpy.run_path(sys.argv[1])
+original = fcntl.flock
+def observed(fd, operation):
+    if operation == fcntl.LOCK_EX:
+        print('waiting', flush=True)
+    return original(fd, operation)
+fcntl.flock = observed
+sys.argv = sys.argv[1:]
+sys.exit(module['main']())
+"""
+        process = subprocess.Popen([sys.executable, "-c", driver, str(CLI), *args],
+                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE)
+        self.addCleanup(self.stop_process, process)
+        process.stdin.write(plan)
+        process.stdin.close()
+        process.stdin = None
+        self.assertEqual(process.stdout.readline(), b"waiting\n")
+        return process
+
+    @staticmethod
+    def stop_process(process):
+        if process.poll() is None:
+            process.kill()
+        process.communicate(timeout=5)
+
+
+class AttemptTests(InitializedWorkspaceTestCase):
     def test_plan_and_derivation_from_current_best(self):
         plan = "# 优化\r\n第一步\n第二步\n\n"
         result = subprocess.run([str(CLI), "new-attempt", str(self.workspace)],
@@ -210,23 +248,23 @@ class AttemptTests(RepositoryTestCase):
         repo = attempt / "repo"
         self.assertEqual(self.git("-C", repo, "rev-parse", "HEAD"),
                          self.git("-C", self.workspace / "best", "rev-parse", "HEAD"))
-        self.assertEqual(os.readlink(self.workspace / "best"), "baseline")
+        self.assertTrue((self.workspace / "best").is_dir())
+        self.assertFalse((self.workspace / "best").is_symlink())
         (repo / "content").write_text("better")
         self.git("-C", repo, "commit", "-am", "better")
-        with LOCK(self.workspace):
-            (self.workspace / "best").unlink()
-            (self.workspace / "best").symlink_to("attempts/attempt-00001/repo")
+        with redirect_stdout(io.StringIO()):
+            COMPLETE(self.workspace, 1, {"latency": 12}, "summary", "details")
         self.new("next")
         next_repo = self.workspace / "attempts/attempt-00002/repo"
         self.assertEqual((next_repo / "content").read_text(), "better")
         self.assertEqual(self.git("-C", next_repo, "rev-parse", "HEAD"),
-                         self.git("-C", repo, "rev-parse", "HEAD"))
+                         self.git("-C", self.workspace / "best", "rev-parse", "HEAD"))
         detached = subprocess.run(["git", "-C", str(next_repo), "symbolic-ref", "HEAD"],
                                   capture_output=True)
         self.assertNotEqual(detached.returncode, 0)
 
     def test_dirty_best_rejected(self):
-        best = self.workspace / "baseline"
+        best = self.workspace / "best"
         before = self.worktrees()
         for kind in ("unstaged", "staged", "untracked"):
             with self.subTest(kind=kind):
@@ -245,7 +283,7 @@ class AttemptTests(RepositoryTestCase):
         self.assertEqual(self.worktrees(), before)
 
     def test_ignored_files_are_allowed(self):
-        best = self.workspace / "baseline"
+        best = self.workspace / "best"
         (best / ".gitignore").write_text("cache\n")
         self.git("-C", best, "add", ".gitignore")
         self.git("-C", best, "commit", "-m", "ignore cache")
@@ -302,36 +340,6 @@ class AttemptTests(RepositoryTestCase):
             self.assertEqual(self.worktrees(), before)
         self.new()  # The lock and database transaction were released after failure.
 
-    def start_waiting_cli(self, args, plan=b"plan\n"):
-        # Announce immediately before the real flock call: no timing-based guesses.
-        driver = r"""
-import fcntl, runpy, sys
-module = runpy.run_path(sys.argv[1])
-original = fcntl.flock
-def observed(fd, operation):
-    if operation == fcntl.LOCK_EX:
-        print('waiting', flush=True)
-    return original(fd, operation)
-fcntl.flock = observed
-sys.argv = sys.argv[1:]
-sys.exit(module['main']())
-"""
-        process = subprocess.Popen([sys.executable, "-c", driver, str(CLI), *args],
-                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                   stderr=subprocess.PIPE)
-        self.addCleanup(self.stop_process, process)
-        process.stdin.write(plan)
-        process.stdin.close()
-        process.stdin = None
-        self.assertEqual(process.stdout.readline(), b"waiting\n")
-        return process
-
-    @staticmethod
-    def stop_process(process):
-        if process.poll() is None:
-            process.kill()
-        process.communicate(timeout=5)
-
     def test_processes_wait_and_create_unique_attempts(self):
         inode = (self.workspace / ".autotune.lock").stat().st_ino
         with LOCK(self.workspace):
@@ -366,6 +374,414 @@ sys.exit(module['main']())
         _, stderr = process.communicate(timeout=10)
         self.assertEqual(process.returncode, 0, stderr)
         self.assertTrue((other / "autotune.db").is_file())
+
+
+class CompletionTests(InitializedWorkspaceTestCase):
+    def candidate(self, attempt_id=1):
+        self.new(f"plan {attempt_id}")
+        repo = self.workspace / "attempts" / f"attempt-{attempt_id:05d}" / "repo"
+        (repo / "content").write_text(f"optimized {attempt_id}")
+        self.git("-C", repo, "commit", "-am", "first change")
+        (repo / "extra").write_text(f"new file {attempt_id}")
+        self.git("-C", repo, "add", "extra")
+        self.git("-C", repo, "commit", "-m", "second change")
+        return repo
+
+    def complete(self, attempt_id=1, metrics=None, summary="summary", details="details", fail=False):
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            COMPLETE(self.workspace, attempt_id, {"latency": 12} if metrics is None else metrics,
+                     summary, details, fail=fail)
+
+    def complete_args(self, attempt_id=1):
+        return ["complete-attempt", str(self.workspace), str(attempt_id),
+                "--metric", '{"latency": 12, "throughput": 56}', "--summary", "summary"]
+
+    def completion_row(self, attempt_id=1):
+        with sqlite3.connect(self.workspace / "autotune.db") as db:
+            return db.execute(
+                "SELECT Status, BaseCommitSHA, SquashCommitSHA FROM Attempts WHERE ID = ?",
+                (attempt_id,),
+            ).fetchone()
+
+    def test_squash_creates_one_commit_and_records_sha(self):
+        repo = self.candidate()
+        best = self.workspace / "best"
+        old = self.git("-C", best, "rev-parse", "HEAD")
+        head = self.git("-C", repo, "rev-parse", "HEAD")
+        inode = best.stat().st_ino
+        result = subprocess.run([str(CLI), *self.complete_args()],
+                                input="details", capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        squash = self.git("-C", best, "rev-parse", "HEAD")
+        self.assertIn(squash, result.stdout)
+        self.assertNotEqual(squash, head)
+        self.assertEqual(self.git("-C", best, "rev-list", "--parents", "-n", "1", squash),
+                         f"{squash} {old}")
+        self.assertEqual(self.git("-C", best, "rev-parse", "HEAD^{tree}"),
+                         self.git("-C", repo, "rev-parse", "HEAD^{tree}"))
+        self.assertEqual(self.git("-C", best, "status", "--porcelain"), "")
+        self.assertEqual(self.completion_row(), ("completed", old, squash))
+        self.assertEqual(self.git("-C", repo, "rev-parse", "HEAD"), head)
+        self.assertEqual((self.workspace / "baseline").read_text(), old + "\n")
+        self.assertEqual(self.git("-C", self.repo, "rev-parse", "HEAD"), old)
+        self.assertEqual(best.stat().st_ino, inode)
+        # A second accepted Attempt extends the same best worktree by one commit.
+        self.candidate(2)
+        self.complete(2)
+        next_sha = self.completion_row(2)[2]
+        self.assertEqual(self.git("-C", best, "rev-parse", "HEAD^"), squash)
+        self.assertEqual(self.git("-C", best, "rev-parse", "HEAD"), next_sha)
+        self.assertEqual((self.workspace / "baseline").read_text(), old + "\n")
+
+    def test_stale_attempt_and_repeated_completion_rejected(self):
+        self.candidate()
+        self.candidate(2)
+        self.complete()
+        best = self.git("-C", self.workspace / "best", "rev-parse", "HEAD")
+        with self.assertRaisesRegex(ValueError, "best 已改变"):
+            self.complete(2)
+        with self.assertRaisesRegex(ValueError, "completed"):
+            self.complete(1)
+        self.assertEqual(self.completion_row(2)[0], "running")
+        self.assertIsNone(self.completion_row(2)[2])
+        self.assertEqual(self.git("-C", self.workspace / "best", "rev-parse", "HEAD"), best)
+
+    def test_dirty_attempt_and_best_rejected(self):
+        repo = self.candidate()
+        original = self.completion_row()
+        for target in (repo, self.workspace / "best"):
+            for kind in ("unstaged", "staged", "untracked"):
+                with self.subTest(target=target, kind=kind):
+                    file = target / ("untracked" if kind == "untracked" else "content")
+                    file.write_text("dirty")
+                    if kind == "staged":
+                        self.git("-C", target, "add", "content")
+                    with self.assertRaisesRegex(ValueError, "未提交"):
+                        self.complete()
+                    self.assertEqual(self.completion_row(), original)
+                    self.assertEqual(file.read_text(), "dirty")
+                    if kind == "untracked":
+                        file.unlink()
+                    else:
+                        self.git("-C", target, "restore", "--source=HEAD", "--staged", "--worktree", "content")
+
+    def test_git_and_database_failures_restore_best(self):
+        repo = self.candidate()
+        best = self.workspace / "best"
+        previous = self.git("-C", best, "rev-parse", "HEAD")
+        candidate_head = self.git("-C", repo, "rev-parse", "HEAD")
+        original_git = COMPLETE.__globals__["git"]
+        original_connect = sqlite3.connect
+
+        class BadCommit(sqlite3.Connection):
+            def commit(self):
+                raise sqlite3.OperationalError("database commit failure")
+
+        def connect(*args, **kwargs):
+            return original_connect(*args, **kwargs, factory=BadCommit)
+
+        def fail_after(operation):
+            def run(*args):
+                result = original_git(*args)
+                if args[2] == operation:
+                    raise RuntimeError(f"failure after {operation}")
+                return result
+            return run
+
+        def fail_commit(*args):
+            if args[2] == "commit":
+                raise RuntimeError("git commit failed")
+            return original_git(*args)
+
+        for failure in (patch.dict(COMPLETE.__globals__, {"git": fail_commit}),
+                        patch.dict(COMPLETE.__globals__, {"git": fail_after("merge")}),
+                        patch.dict(COMPLETE.__globals__, {"git": fail_after("commit")}),
+                        patch.object(sqlite3, "connect", connect)):
+            with failure, self.assertRaises((RuntimeError, sqlite3.Error)):
+                self.complete()
+            self.assertEqual(self.completion_row(), ("running", previous, None))
+            self.assertEqual(self.git("-C", best, "rev-parse", "HEAD"), previous)
+            self.assertEqual(self.git("-C", best, "status", "--porcelain"), "")
+            self.assertEqual(self.git("-C", repo, "rev-parse", "HEAD"), candidate_head)
+            self.assertEqual((self.workspace / "baseline").read_text(), previous + "\n")
+        self.complete()
+
+    def test_no_change_missing_and_failed_attempts_rejected(self):
+        self.new()
+        with self.assertRaisesRegex(ValueError, "没有可合入"):
+            self.complete()
+        for attempt_id in (0, -1, 99):
+            with self.assertRaises(ValueError):
+                self.complete(attempt_id)
+        with sqlite3.connect(self.workspace / "autotune.db") as db:
+            db.execute("UPDATE Attempts SET Status='failed' WHERE ID=1")
+        with self.assertRaisesRegex(ValueError, "failed"):
+            self.complete()
+
+    def test_complete_requires_squash_sha_in_database(self):
+        self.new()
+        with sqlite3.connect(self.workspace / "autotune.db") as db:
+            with self.assertRaises(sqlite3.IntegrityError):
+                db.execute("UPDATE Attempts SET Status='completed' WHERE ID=1")
+            with self.assertRaises(sqlite3.IntegrityError):
+                db.execute("UPDATE Attempts SET SquashCommitSHA='unexpected' WHERE ID=1")
+
+    def test_completion_and_creation_share_lock(self):
+        self.candidate()
+        original = self.completion_row()
+        with LOCK(self.workspace):
+            process = self.start_waiting_cli(self.complete_args())
+            self.assertIsNone(process.poll())
+            self.assertEqual(self.completion_row(), original)
+            self.assertEqual(self.git("-C", self.workspace / "best", "rev-parse", "HEAD"), original[1])
+            self.assertFalse((self.workspace / "attempts/attempt-00001/result.json").exists())
+            self.assertFalse((self.workspace / "attempts/attempt-00001/result.md").exists())
+            with sqlite3.connect(self.workspace / "autotune.db") as db:
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM Metrics").fetchone(), (0,))
+                self.assertEqual(db.execute("SELECT Summary, Details FROM Attempts WHERE ID=1").fetchone(),
+                                 (None, None))
+        _, stderr = process.communicate(timeout=10)
+        self.assertEqual(process.returncode, 0, stderr)
+        self.new("after squash")
+        self.assertEqual(self.completion_row(2)[1], self.completion_row(1)[2])
+
+    def test_old_layout_rejected_without_migration(self):
+        baseline = self.workspace / "baseline"
+        baseline.unlink()
+        self.git("-C", self.repo, "worktree", "move", self.workspace / "best", baseline)
+        (self.workspace / "best").symlink_to("baseline")
+        before = self.worktrees()
+        for call in (self.new, self.complete):
+            with self.assertRaisesRegex(ValueError, "旧版 workspace"):
+                call()
+        self.assertTrue(baseline.is_dir())
+        self.assertEqual(os.readlink(self.workspace / "best"), "baseline")
+        self.assertEqual(self.worktrees(), before)
+
+    def test_concurrent_completions_accept_only_one_base(self):
+        self.candidate()
+        self.candidate(2)
+        with LOCK(self.workspace):
+            processes = [self.start_waiting_cli(self.complete_args(i))
+                         for i in (1, 2)]
+            self.assertTrue(all(p.poll() is None for p in processes))
+            self.assertEqual([self.completion_row(i)[0] for i in (1, 2)], ["running", "running"])
+        for process in processes:
+            process.communicate(timeout=10)
+        self.assertCountEqual([p.returncode for p in processes], [0, 1])
+        self.assertCountEqual([self.completion_row(i)[0] for i in (1, 2)], ["running", "completed"])
+        winner = next(self.completion_row(i)[2] for i in (1, 2) if self.completion_row(i)[0] == "completed")
+        self.assertEqual(self.git("-C", self.workspace / "best", "rev-parse", "HEAD"), winner)
+
+    def test_old_database_rejected_without_migration(self):
+        path = self.workspace / "autotune.db"
+        path.unlink()
+        with sqlite3.connect(path) as db:
+            db.execute("CREATE TABLE Attempts (ID INTEGER PRIMARY KEY, Plan TEXT, Status TEXT)")
+        before = path.read_bytes()
+        for call in (self.new, self.complete):
+            with self.assertRaisesRegex(ValueError, "旧版或无效"):
+                call()
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_result_inputs_are_saved_to_database_and_files(self):
+        self.candidate()
+        self.new("another candidate")
+        with sqlite3.connect(self.workspace / "autotune.db") as db:
+            db.execute("INSERT INTO Metrics (AttemptID, Name, Value) VALUES (1, 'old', 99)")
+            db.execute("INSERT INTO Metrics (AttemptID, Name, Value) VALUES (2, 'keep', 100)")
+        metrics = {"latency": 12, "throughput": 56.5}
+        summary = "优化延迟，吞吐量提高"
+        details = "第一行\r\n\n## 验证\n正确性通过。\n\n"
+        result = subprocess.run(
+            [str(CLI), "complete-attempt", str(self.workspace), "1",
+             "--metric", json.dumps(metrics), "--summary", summary],
+            input=details.encode("utf-8"), capture_output=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        attempt = self.workspace / "attempts/attempt-00001"
+        saved = json.loads((attempt / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual(saved, {"status": "completed", "metrics": metrics, "summary": summary, "details": details,
+                                 "squash_commit_sha": self.completion_row()[2]})
+        self.assertEqual((attempt / "result.md").read_bytes(),
+                         f"# Summary\n\n{summary}\n\n# Details\n\n{details}".encode("utf-8"))
+        with sqlite3.connect(self.workspace / "autotune.db") as db:
+            self.assertEqual(db.execute("SELECT Summary, Details FROM Attempts WHERE ID=1").fetchone(),
+                             (summary, details))
+            self.assertEqual(dict(db.execute("SELECT Name, Value FROM Metrics WHERE AttemptID=1")), metrics)
+            self.assertEqual(db.execute("SELECT Name, Value FROM Metrics WHERE AttemptID=2").fetchall(),
+                             [("keep", 100)])
+
+    def test_invalid_metric_and_summary_rejected_before_modification(self):
+        self.candidate()
+        old = self.completion_row()
+        invalid_metrics = ['{}', '[]', 'null', '{', '{"x": true}', '{"x": "12"}',
+                           '{"x": NaN}', '{"x": Infinity}', '{"x": 1e999}',
+                           '{" ": 12}', '{"x": 1, "x": 2}']
+        invalid_options = [["--metric", value, "--summary", "summary"] for value in invalid_metrics]
+        invalid_options += [["--metric", '{"x": 12}', "--summary", value]
+                            for value in ("", " \n\t")]
+        invalid_options += [["--metric", '{"x": 12}'], ["--summary", "summary"]]
+        for options in invalid_options:
+            with self.subTest(options=options):
+                result = subprocess.run([str(CLI), "complete-attempt", str(self.workspace), "1", *options],
+                                        input=b"detail", capture_output=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self.completion_row(), old)
+                self.assertEqual(self.git("-C", self.workspace / "best", "rev-parse", "HEAD"), old[1])
+                self.assertFalse((self.workspace / "attempts/attempt-00001/result.json").exists())
+        for summary in ("", " \n\t"):
+            with self.assertRaisesRegex(ValueError, "--summary"):
+                self.complete(summary=summary)
+
+    def test_result_files_and_database_restored_after_failure(self):
+        self.candidate()
+        attempt = self.workspace / "attempts/attempt-00001"
+        before = self.completion_row()
+        original_replace = COMPLETE.__globals__["replace_file"]
+        original_connect = sqlite3.connect
+
+        class BadCommit(sqlite3.Connection):
+            def commit(self):
+                raise sqlite3.OperationalError("database commit failure")
+
+        def connect(*args, **kwargs):
+            return original_connect(*args, **kwargs, factory=BadCommit)
+
+        def fail_after_write(name):
+            failed = False
+
+            def replace(path, content, mode=0o644):
+                nonlocal failed
+                original_replace(path, content, mode)
+                if path.name == name and not failed:
+                    failed = True
+                    raise OSError("file write failure")
+            return replace
+
+        for existing in (False, True):
+            with sqlite3.connect(self.workspace / "autotune.db") as db:
+                db.execute("UPDATE Attempts SET Summary='old summary', Details='old detail' WHERE ID=1")
+                db.execute("DELETE FROM Metrics WHERE AttemptID=1")
+                db.execute("INSERT INTO Metrics (AttemptID, Name, Value) VALUES (1, 'old metric', 5)")
+            old_files = {"result.json": b'{"old": true}\n', "result.md": b"old report\r\n"}
+            if existing:
+                for name, content in old_files.items():
+                    (attempt / name).write_bytes(content)
+                    (attempt / name).chmod(0o640)
+            for failure in (
+                patch.dict(COMPLETE.__globals__, {"replace_file": fail_after_write("result.json")}),
+                patch.dict(COMPLETE.__globals__, {"replace_file": fail_after_write("result.md")}),
+                patch.object(sqlite3, "connect", connect),
+            ):
+                with self.subTest(existing=existing), failure, self.assertRaises((OSError, sqlite3.Error)):
+                    self.complete()
+                self.assertEqual(self.completion_row(), before)
+                self.assertEqual(self.git("-C", self.workspace / "best", "rev-parse", "HEAD"), before[1])
+                self.assertEqual(self.git("-C", self.workspace / "best", "status", "--porcelain"), "")
+                for name, content in old_files.items():
+                    if existing:
+                        self.assertEqual((attempt / name).read_bytes(), content)
+                        self.assertEqual((attempt / name).stat().st_mode & 0o777, 0o640)
+                    else:
+                        self.assertFalse((attempt / name).exists())
+                self.assertEqual(list(attempt.glob(".result.*")), [])
+                with sqlite3.connect(self.workspace / "autotune.db") as db:
+                    self.assertEqual(db.execute("SELECT Summary, Details FROM Attempts WHERE ID=1").fetchone(),
+                                     ("old summary", "old detail"))
+                    self.assertEqual(db.execute("SELECT Name, Value FROM Metrics WHERE AttemptID=1").fetchall(),
+                                     [("old metric", 5)])
+        self.complete()  # Rollback released the transaction and lock; a retry succeeds.
+
+    def test_result_symlink_is_not_followed(self):
+        self.candidate()
+        target = self.root / "outside-result.json"
+        target.write_text("keep")
+        (self.workspace / "attempts/attempt-00001/result.json").symlink_to(target)
+        before = self.completion_row()
+        with self.assertRaisesRegex(ValueError, "普通文件"):
+            self.complete()
+        self.assertEqual(target.read_text(), "keep")
+        self.assertEqual(self.completion_row(), before)
+
+    def test_fail_records_results_with_stale_base_and_dirty_worktrees(self):
+        repo = self.candidate()
+        self.candidate(2)
+        self.complete(2)
+        best = self.workspace / "best"
+        best_head = self.git("-C", best, "rev-parse", "HEAD")
+        base = self.completion_row()[1]
+        self.assertNotEqual(best_head, base)
+        for target in (repo, best):
+            (target / "content").write_text("dirty content")
+            (target / "untracked").write_text("untracked content")
+        before = {target: self.git("-C", target, "status", "--porcelain") for target in (repo, best)}
+        result = subprocess.run([str(CLI), *self.complete_args(), "--fail"],
+                                input="失败详情\n", text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("failed", result.stdout)
+        self.assertEqual(self.completion_row(), ("failed", base, None))
+        self.assertEqual(self.git("-C", best, "rev-parse", "HEAD"), best_head)
+        for target, status in before.items():
+            self.assertEqual(self.git("-C", target, "status", "--porcelain"), status)
+            self.assertEqual((target / "content").read_text(), "dirty content")
+            self.assertEqual((target / "untracked").read_text(), "untracked content")
+        attempt = self.workspace / "attempts/attempt-00001"
+        saved = json.loads((attempt / "result.json").read_text())
+        self.assertEqual(saved, {"status": "failed", "metrics": {"latency": 12, "throughput": 56},
+                                 "summary": "summary", "details": "失败详情\n", "squash_commit_sha": None})
+        self.assertIn("失败详情\n", (attempt / "result.md").read_text())
+        with sqlite3.connect(self.workspace / "autotune.db") as db:
+            self.assertEqual(dict(db.execute("SELECT Name, Value FROM Metrics WHERE AttemptID=1")), saved["metrics"])
+            self.assertEqual(db.execute("SELECT Summary, Details FROM Attempts WHERE ID=1").fetchone(),
+                             ("summary", "失败详情\n"))
+
+    def test_fail_without_candidate_changes_waits_for_lock(self):
+        self.new()
+        before = self.completion_row()
+        with LOCK(self.workspace):
+            process = self.start_waiting_cli([*self.complete_args(), "--fail"])
+            self.assertIsNone(process.poll())
+            self.assertEqual(self.completion_row(), before)
+            self.assertFalse((self.workspace / "attempts/attempt-00001/result.json").exists())
+        _, stderr = process.communicate(timeout=10)
+        self.assertEqual(process.returncode, 0, stderr)
+        self.assertEqual(self.completion_row(), ("failed", before[1], None))
+        self.assertEqual(self.git("-C", self.workspace / "best", "rev-parse", "HEAD"), before[1])
+
+    def test_failed_result_write_rolls_back_without_touching_best(self):
+        self.new()
+        best = self.workspace / "best"
+        (best / "content").write_text("pending edits")
+        original = self.completion_row()
+        original_replace = COMPLETE.__globals__["replace_file"]
+        original_connect = sqlite3.connect
+
+        def write_then_fail(path, content, mode=0o644):
+            original_replace(path, content, mode)
+            if path.name == "result.md":
+                raise OSError("failed to write report")
+
+        class BadCommit(sqlite3.Connection):
+            def commit(self):
+                raise sqlite3.OperationalError("database commit failure")
+
+        def connect(*args, **kwargs):
+            return original_connect(*args, **kwargs, factory=BadCommit)
+
+        for failure in (patch.dict(COMPLETE.__globals__, {"replace_file": write_then_fail}),
+                        patch.object(sqlite3, "connect", connect)):
+            with failure, self.assertRaises((OSError, sqlite3.Error)):
+                self.complete(fail=True)
+            self.assertEqual(self.completion_row(), original)
+            self.assertEqual((best / "content").read_text(), "pending edits")
+            for name in ("result.json", "result.md"):
+                self.assertFalse((self.workspace / "attempts/attempt-00001" / name).exists())
+            with sqlite3.connect(self.workspace / "autotune.db") as db:
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM Metrics").fetchone(), (0,))
+                self.assertEqual(db.execute("SELECT Summary, Details FROM Attempts WHERE ID=1").fetchone(),
+                                 (None, None))
+        self.complete(fail=True)
 
 
 if __name__ == "__main__":
