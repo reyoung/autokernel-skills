@@ -45,7 +45,7 @@ workspace/
 ## 优化 Attempt
 
 1. 若 `target-metric.json` 已达 `max_attempts`，停止循环。
-2. **生成 plan 之前**必须运行 `autotune-tools get-context <workspace>`，根据 stdout 的 Markdown（best 相对 baseline、user prompt、近 10 次 Attempt、reference README）撰写计划；不可凭记忆跳过。计划须写明拟借鉴的参考项目/技术点，以及预期影响的监控指标。
+2. **生成 plan 之前**必须运行 `autotune-tools get-context <workspace>`，根据 stdout 的 Markdown（workspace 绝对路径与目录结构、best 相对 baseline、user prompt、近 10 次 Attempt、reference README）撰写计划；不可凭记忆跳过。计划须写明拟借鉴的参考项目/技术点，以及预期影响的监控指标。
 3. 将计划 stdin 传给 `new-attempt <workspace>`。
 4. 在候选 repo 中改代码；先跑 verify，失败则 `--fail` 结束。再跑 benchmark，收集 `target-metric` 中全部指标。
 5. 成功时提交全部待接受修改并使 repo 干净，执行  

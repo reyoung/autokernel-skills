@@ -20,10 +20,11 @@ description: 使用 bundled CLI autotune-tools 管理 autotune workspace 时使�
 
 `get-context <workspace>`：在锁下读取状态，将 Markdown 写到 **stdout**（供生成 Attempt plan 前必读）：
 
-1. 当前 best 相对初始 baseline 的监控指标变化  
-2. `user_prompt.md`  
-3. 最近至多 10 次 Attempt 的指标相对 baseline 变化、summary、directory  
-4. `reference/README.md`（缺失时注明）
+1. workspace 绝对路径与目录结构概览  
+2. 当前 best 相对初始 baseline 的监控指标变化  
+3. `user_prompt.md`  
+4. 最近至多 10 次 Attempt 的指标相对 baseline 变化、summary、directory  
+5. `reference/README.md`（缺失时注明）
 
 ## new-attempt / complete-attempt
 

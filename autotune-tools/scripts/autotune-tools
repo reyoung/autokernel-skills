@@ -641,6 +641,31 @@ def get_context(workspace):
         parts = [
             "# Autotune Context",
             "",
+            "## Workspace",
+            "",
+            f"- path: `{workspace}`",
+            "",
+            "目录结构大约为：",
+            "",
+            "```",
+            f"{workspace}/",
+            "├── .autotune.lock",
+            "├── user_prompt.md",
+            "├── baseline                  # 初始 HEAD 的完整 commit SHA",
+            "├── baseline_meta.json        # 评测元信息（verify/benchmark）",
+            "├── target-metric.json        # 监控指标、baseline 值、可选 max_attempts",
+            "├── autotune.db",
+            "├── best/                     # 当前最优 worktree",
+            "├── reference/",
+            "│   └── README.md             # 入选参考项目简介",
+            "└── attempts/",
+            "    └── attempt-NNNNN/",
+            "        ├── plan.md",
+            "        ├── result.json",
+            "        ├── result.md",
+            "        └── repo/             # 候选实现 worktree",
+            "```",
+            "",
             "## Best 相对初始 baseline",
             "",
             f"- best HEAD: `{best_head}`",
@@ -830,8 +855,9 @@ def main():
     context = commands.add_parser(
         "get-context", help="输出规划用 Markdown 上下文到 stdout",
         description=(
-            "在 workspace 锁下读取 best 相对初始 baseline 的指标变化、user_prompt.md、"
-            "最近 10 次 Attempt 的指标/summary/目录，以及 reference/README.md；格式化为 Markdown 写到 stdout。"
+            "在 workspace 锁下读取 workspace 绝对路径与目录结构概览、best 相对初始 baseline 的指标变化、"
+            "user_prompt.md、最近 10 次 Attempt 的指标/summary/目录，以及 reference/README.md；"
+            "格式化为 Markdown 写到 stdout。"
         ),
     )
     context.add_argument("workspace", help="已初始化的 workspace 目录")
