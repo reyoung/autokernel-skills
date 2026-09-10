@@ -5,10 +5,11 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import closing, contextmanager
 import fcntl
+import hashlib
 import json
 import math
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import shutil
 import sqlite3
 import subprocess
@@ -26,6 +27,13 @@ def git(*args):
 
 
 LOCK_NAME = ".autotune.lock"
+BASELINE_META_NAME = "baseline_meta.json"
+TARGET_METRIC_NAME = "target-metric.json"
+REGRESSION_TOLERANCE = 0.01
+WORKSPACE_ARTIFACTS = (
+    "user_prompt.md", "baseline", "best", "autotune.db", "reference", "attempts",
+    BASELINE_META_NAME, TARGET_METRIC_NAME,
+)
 
 
 @contextmanager
@@ -80,6 +88,160 @@ def create_database(path):
         """)
 
 
+def load_json_object(path):
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"重复的 JSON 键: {key!r}")
+            result[key] = value
+        return result
+
+    def finite_float(value):
+        result = float(value)
+        if not math.isfinite(result):
+            raise ValueError(f"非有限 JSON 数字: {value}")
+        return result
+
+    def reject_constant(value):
+        raise ValueError(f"无效的 JSON 常量: {value}")
+
+    with Path(path).open(encoding="utf-8") as stream:
+        data = json.load(
+            stream,
+            object_pairs_hook=unique_object,
+            parse_float=finite_float,
+            parse_constant=reject_constant,
+        )
+    if not isinstance(data, dict):
+        raise ValueError(f"JSON 根必须是对象: {path}")
+    return data
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def relative_project_path(value, label):
+    path = PurePosixPath(value)
+    if not isinstance(value, str) or not value.strip() or path.is_absolute() or ".." in path.parts:
+        raise ValueError(f"{label} 必须是项目相对路径且不含 '..': {value!r}")
+    return path
+
+
+def load_baseline_meta(path):
+    meta = load_json_object(path)
+    if meta.get("schema_version") != 1:
+        raise ValueError("baseline meta 的 schema_version 必须为 1")
+    for key in ("protected_files", "evaluation", "metrics"):
+        if key not in meta:
+            raise ValueError(f"baseline meta 缺少 {key}")
+    evaluation = meta["evaluation"]
+    metrics = meta["metrics"]
+    if not isinstance(evaluation, dict) or not isinstance(metrics, dict):
+        raise ValueError("baseline meta 的 evaluation/metrics 必须是对象")
+    for mode in ("verify", "benchmark"):
+        if mode not in evaluation or mode not in metrics:
+            raise ValueError(f"baseline meta 缺少 evaluation.{mode} 或 metrics.{mode}")
+        runner = evaluation[mode]
+        if (not isinstance(runner, dict) or not isinstance(runner.get("script"), str)
+                or not isinstance(runner.get("command"), list) or not runner["command"]):
+            raise ValueError(f"baseline meta evaluation.{mode} 需要 script 与非空 command")
+        relative_project_path(runner["script"], f"evaluation.{mode}.script")
+        group = metrics[mode]
+        if not isinstance(group, dict) or not group:
+            raise ValueError(f"baseline meta metrics.{mode} 必须是非空对象")
+        for name, spec in group.items():
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError(f"baseline meta metrics.{mode} 含无效名称")
+            if (not isinstance(spec, dict) or spec.get("direction") not in ("minimize", "maximize")
+                    or not isinstance(spec.get("unit"), str) or not spec["unit"].strip()):
+                raise ValueError(f"baseline meta metrics.{mode}.{name} 需要 unit 与 direction")
+    protected = meta["protected_files"]
+    if not isinstance(protected, list) or not protected:
+        raise ValueError("baseline meta protected_files 必须是非空数组")
+    seen = set()
+    for index, record in enumerate(protected):
+        if not isinstance(record, dict):
+            raise ValueError(f"protected_files[{index}] 必须是对象")
+        file_path = relative_project_path(record.get("path"), f"protected_files[{index}].path")
+        checksum = record.get("checksum")
+        if (not isinstance(checksum, str) or len(checksum) != 64
+                or any(c not in "0123456789abcdef" for c in checksum)):
+            raise ValueError(f"protected_files[{index}].checksum 必须是 64 位小写十六进制 SHA-256")
+        if file_path in seen:
+            raise ValueError(f"protected_files 重复路径: {file_path}")
+        seen.add(file_path)
+    for mode in ("verify", "benchmark"):
+        script = PurePosixPath(evaluation[mode]["script"])
+        if script not in seen:
+            raise ValueError(f"evaluation.{mode}.script 必须列入 protected_files")
+    if (PurePosixPath(evaluation["verify"]["script"]) == PurePosixPath(evaluation["benchmark"]["script"])
+            and evaluation["verify"]["command"] == evaluation["benchmark"]["command"]):
+        raise ValueError("共享 script 时 verify 与 benchmark 的 command 必须不同")
+    return meta
+
+
+def verify_protected_files(root, meta):
+    for record in meta["protected_files"]:
+        path = root / record["path"]
+        if not path.is_file() or path.is_symlink():
+            raise ValueError(f"受保护文件不存在或不是普通文件: {record['path']}")
+        actual = sha256_file(path)
+        if actual != record["checksum"]:
+            raise ValueError(
+                f"受保护文件 checksum 不匹配: {record['path']} "
+                f"(期望 {record['checksum']}，实际 {actual})"
+            )
+
+
+def parse_metric_baseline(text):
+    if "=" not in text:
+        raise ValueError(f"--metric 格式为 NAME=VALUE: {text!r}")
+    name, raw = text.split("=", 1)
+    name = name.strip()
+    if not name:
+        raise ValueError(f"--metric 名称不能为空: {text!r}")
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise ValueError(f"--metric 值不是合法 JSON 数字: {text!r}") from error
+    if type(value) not in (int, float) or isinstance(value, bool) or not math.isfinite(value):
+        raise ValueError(f"--metric 值必须是有限数值: {text!r}")
+    return name, float(value)
+
+
+def build_target_metric(meta, baselines, max_attempts):
+    benchmark = meta["metrics"]["benchmark"]
+    unknown = sorted(set(baselines) - set(benchmark))
+    if unknown:
+        raise ValueError(f"--metric 不在 baseline meta.metrics.benchmark 中: {', '.join(unknown)}")
+    if not baselines:
+        raise ValueError("至少指定一个 --metric NAME=VALUE")
+    metrics = {}
+    for name, value in baselines.items():
+        spec = benchmark[name]
+        metrics[name] = {
+            "unit": spec["unit"],
+            "direction": spec["direction"],
+            "baseline": value,
+        }
+    target = {"metrics": metrics}
+    if max_attempts is not None:
+        if not isinstance(max_attempts, int) or isinstance(max_attempts, bool) or max_attempts < 1:
+            raise ValueError("--max-attempts 必须是正整数")
+        target["max_attempts"] = max_attempts
+    return target
+
+
+def write_json(path, data):
+    replace_file(path, (json.dumps(data, ensure_ascii=False, indent=2, allow_nan=False) + "\n").encode("utf-8"))
+
+
 def clone_reference(reference, root):
     url, revision, name = reference
     destination = root / name
@@ -116,13 +278,16 @@ def download_references(references, root):
         raise RuntimeError("参考仓库初始化失败:\n" + "\n".join(errors))
 
 
-def init_workspace(repo, workspace, references, user_prompt):
+def init_workspace(repo, workspace, references, user_prompt, baseline_meta_path, metric_baselines,
+                   max_attempts=None):
     if not user_prompt.strip():
         raise ValueError("stdin 中的用户原始请求不能为空或仅包含空白。")
     repo = Path(repo).resolve()
     workspace = Path(workspace).absolute()
     if not repo.is_dir():
         raise ValueError(f"本地仓库目录不存在: {repo}")
+    meta = load_baseline_meta(baseline_meta_path)
+    target = build_target_metric(meta, metric_baselines, max_attempts)
     commit = git("-C", repo, "rev-parse", "--verify", "HEAD^{commit}")
     if workspace.is_symlink():
         raise ValueError(f"workspace 不能是软链接: {workspace}")
@@ -138,15 +303,17 @@ def init_workspace(repo, workspace, references, user_prompt):
     workspace.mkdir(parents=True, exist_ok=True)
     with workspace_lock(workspace):
         check_empty_workspace(workspace)
-        baseline = workspace / "baseline"
         best = workspace / "best"
         try:
             (workspace / "user_prompt.md").write_bytes(user_prompt.encode("utf-8"))
-            baseline.write_text(commit + "\n", encoding="ascii")
+            (workspace / "baseline").write_text(commit + "\n", encoding="ascii")
             git("-C", repo, "worktree", "add", "--detach", best, commit)
             create_database(workspace / "autotune.db")
             (workspace / "reference").mkdir()
             (workspace / "attempts").mkdir()
+            shutil.copyfile(baseline_meta_path, workspace / BASELINE_META_NAME)
+            write_json(workspace / TARGET_METRIC_NAME, target)
+            verify_protected_files(best, meta)
             download_references(references, workspace / "reference")
         except BaseException:
             # The executor has finished before cleanup, so no clone can recreate files.
@@ -157,7 +324,7 @@ def init_workspace(repo, workspace, references, user_prompt):
                       file=sys.stderr)
                 raise
             try:
-                for name in ("user_prompt.md", "baseline", "best", "autotune.db", "reference", "attempts"):
+                for name in WORKSPACE_ARTIFACTS:
                     path = workspace / name
                     if path.is_symlink() or path.is_file():
                         path.unlink()
@@ -183,6 +350,28 @@ def require_clean(path, label):
         raise ValueError(f"{label} 含有未提交或未跟踪的修改，请先提交或清理: {path}")
 
 
+def load_target_metric(workspace):
+    path = workspace / TARGET_METRIC_NAME
+    if not path.is_file() or path.is_symlink():
+        raise ValueError(f"缺少 {TARGET_METRIC_NAME}: {path}")
+    target = load_json_object(path)
+    metrics = target.get("metrics")
+    if not isinstance(metrics, dict) or not metrics:
+        raise ValueError(f"{TARGET_METRIC_NAME} 的 metrics 必须是非空对象")
+    for name, spec in metrics.items():
+        if (not isinstance(name, str) or not name.strip() or not isinstance(spec, dict)
+                or spec.get("direction") not in ("minimize", "maximize")
+                or type(spec.get("baseline")) not in (int, float)
+                or isinstance(spec.get("baseline"), bool)
+                or not math.isfinite(spec["baseline"])):
+            raise ValueError(f"{TARGET_METRIC_NAME} 中 metric {name!r} 无效")
+    max_attempts = target.get("max_attempts")
+    if max_attempts is not None and (
+            not isinstance(max_attempts, int) or isinstance(max_attempts, bool) or max_attempts < 1):
+        raise ValueError(f"{TARGET_METRIC_NAME} 的 max_attempts 必须是正整数")
+    return target
+
+
 @contextmanager
 def open_workspace(workspace):
     """Validate the current layout and keep all reads/writes under its lock."""
@@ -194,13 +383,19 @@ def open_workspace(workspace):
         baseline = workspace / "baseline"
         attempts = workspace / "attempts"
         best = workspace / "best"
+        meta = workspace / BASELINE_META_NAME
         if baseline.is_dir() or best.is_symlink():
             raise ValueError("旧版 workspace 布局不再支持，请使用 init-workspace 创建新的 workspace。")
         if (not database.is_file() or database.is_symlink()
                 or not baseline.is_file() or baseline.is_symlink()
                 or not attempts.is_dir() or attempts.is_symlink()
-                or not best.is_dir()):
-            raise ValueError(f"无效的 workspace（需要数据库、baseline SHA 文件、best worktree 和 attempts/）: {workspace}")
+                or not best.is_dir()
+                or not meta.is_file() or meta.is_symlink()):
+            raise ValueError(
+                f"无效的 workspace（需要数据库、baseline SHA、baseline_meta.json、"
+                f"target-metric.json、best worktree 和 attempts/）: {workspace}"
+            )
+        target = load_target_metric(workspace)
         check_worktree(best, "best")
         baseline_sha = baseline.read_text(encoding="ascii").strip()
         resolved = git("-C", best, "rev-parse", "--verify", "--end-of-options",
@@ -212,14 +407,19 @@ def open_workspace(workspace):
             columns = {row[1] for row in db.execute("PRAGMA table_info(Attempts)")}
             if not {"BaseCommitSHA", "SquashCommitSHA"} <= columns:
                 raise ValueError("旧版或无效的数据库，请使用 init-workspace 创建新的 workspace。")
-            yield workspace, best, db
+            yield workspace, best, db, target
 
 
 def new_attempt(workspace, plan):
     if not plan.strip():
         raise ValueError("plan 不能为空或仅包含空白。")
-    with open_workspace(workspace) as (workspace, best, db):
+    with open_workspace(workspace) as (workspace, best, db, target):
         require_clean(best, "best")
+        max_attempts = target.get("max_attempts")
+        if max_attempts is not None:
+            count = db.execute("SELECT COUNT(*) FROM Attempts").fetchone()[0]
+            if count >= max_attempts:
+                raise ValueError(f"已达到 max_attempts={max_attempts}，停止创建新的 Attempt")
         commit = git("-C", best, "rev-parse", "--verify", "HEAD^{commit}")
         db.execute("BEGIN IMMEDIATE")
         created = False
@@ -256,7 +456,8 @@ def validate_metrics(metrics):
     for name, value in metrics.items():
         try:
             valid = (isinstance(name, str) and bool(name.strip())
-                     and type(value) in (int, float) and math.isfinite(value))
+                     and type(value) in (int, float) and not isinstance(value, bool)
+                     and math.isfinite(value))
         except OverflowError:
             valid = False
         if not valid:
@@ -277,6 +478,83 @@ def parse_metrics(text):
     return metrics
 
 
+def require_target_metrics(metrics, target):
+    expected = set(target["metrics"])
+    actual = set(metrics)
+    missing = sorted(expected - actual)
+    extra = sorted(actual - expected)
+    if missing or extra:
+        parts = []
+        if missing:
+            parts.append("缺少 " + ", ".join(missing))
+        if extra:
+            parts.append("多余 " + ", ".join(extra))
+        raise ValueError("提交的 metric 必须恰好覆盖 target-metric: " + "；".join(parts))
+
+
+def reference_metrics(db, best, target):
+    head = git("-C", best, "rev-parse", "HEAD")
+    row = db.execute(
+        "SELECT ID FROM Attempts WHERE Status = 'completed' AND SquashCommitSHA = ?",
+        (head,),
+    ).fetchone()
+    if row is None:
+        return baseline_metrics(target)
+    values = dict(db.execute("SELECT Name, Value FROM Metrics WHERE AttemptID = ?", (row[0],)))
+    require_target_metrics(values, target)
+    return {name: float(values[name]) for name in target["metrics"]}
+
+
+def relative_degradation(old, new, direction):
+    if direction == "minimize":
+        if new <= old:
+            return 0.0
+        if old == 0:
+            return math.inf
+        return (new - old) / abs(old)
+    if new >= old:
+        return 0.0
+    if old == 0:
+        return math.inf
+    return (old - new) / abs(old)
+
+
+def is_improved(old, new, direction):
+    return new < old if direction == "minimize" else new > old
+
+
+def check_pareto(metrics, reference, target, allow_regression):
+    improved = []
+    degraded = []
+    for name, spec in target["metrics"].items():
+        old = reference[name]
+        new = float(metrics[name])
+        direction = spec["direction"]
+        degradation = relative_degradation(old, new, direction)
+        if degradation > 0:
+            degraded.append((name, degradation))
+        elif is_improved(old, new, direction):
+            improved.append(name)
+    if not improved:
+        raise ValueError("帕累托检查失败：至少一个监控指标必须相对当前 best 提升")
+    severe = [(name, deg) for name, deg in degraded if deg > REGRESSION_TOLERANCE]
+    mild = [(name, deg) for name, deg in degraded if 0 < deg <= REGRESSION_TOLERANCE]
+    if allow_regression:
+        return
+    if severe:
+        details = ", ".join(f"{name} 劣化 {deg:.2%}" for name, deg in severe)
+        raise ValueError(
+            f"帕累托检查失败：存在超过 {REGRESSION_TOLERANCE:.0%} 的劣化（{details}）。"
+            f"若需显式合入，请加 --allow-regression"
+        )
+    if len(mild) > 1:
+        details = ", ".join(name for name, _ in mild)
+        raise ValueError(
+            f"帕累托检查失败：最多允许一个指标在 {REGRESSION_TOLERANCE:.0%} 内劣化，"
+            f"当前劣化指标: {details}"
+        )
+
+
 def replace_file(path, content, mode=0o644):
     """Publish a complete file via rename; never expose a partial write."""
     fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
@@ -289,13 +567,139 @@ def replace_file(path, content, mode=0o644):
         Path(temporary).unlink(missing_ok=True)
 
 
-def complete_attempt(workspace, attempt_id, metrics, summary, details, fail=False):
+def baseline_metrics(target):
+    return {name: float(spec["baseline"]) for name, spec in target["metrics"].items()}
+
+
+def format_signed(value):
+    if not math.isfinite(value):
+        return "inf" if value > 0 else "-inf"
+    return f"{value:+.6g}"
+
+
+def metric_delta_line(name, old, new, direction, unit):
+    absolute = new - old
+    if direction == "minimize":
+        if old == 0:
+            relative = math.inf if new < 0 else (-math.inf if new > 0 else 0.0)
+        else:
+            relative = (old - new) / abs(old)
+    else:
+        if old == 0:
+            relative = math.inf if new > 0 else (-math.inf if new < 0 else 0.0)
+        else:
+            relative = (new - old) / abs(old)
+    rel_text = "inf" if relative == math.inf else ("-inf" if relative == -math.inf else f"{relative:+.2%}")
+    return (
+        f"- `{name}` ({direction}, {unit}): {old:.6g} → {new:.6g} "
+        f"(Δ {format_signed(absolute)}, 相对提升 {rel_text})"
+    )
+
+
+def format_metric_changes(metrics, reference, target):
+    lines = []
+    for name, spec in target["metrics"].items():
+        if name not in metrics:
+            lines.append(f"- `{name}`: （缺失）")
+            continue
+        lines.append(metric_delta_line(
+            name, float(reference[name]), float(metrics[name]),
+            spec["direction"], spec["unit"],
+        ))
+    return "\n".join(lines)
+
+
+def attempt_metrics_map(db, attempt_id):
+    return dict(db.execute("SELECT Name, Value FROM Metrics WHERE AttemptID = ?", (attempt_id,)))
+
+
+def get_context(workspace):
+    """Render planning context as Markdown on stdout."""
+    with open_workspace(workspace) as (workspace, best, db, target):
+        baselines = baseline_metrics(target)
+        best_values = reference_metrics(db, best, target)
+        best_head = git("-C", best, "rev-parse", "HEAD")
+        baseline_sha = (workspace / "baseline").read_text(encoding="ascii").strip()
+        prompt_path = workspace / "user_prompt.md"
+        if not prompt_path.is_file() or prompt_path.is_symlink():
+            raise ValueError(f"缺少 user_prompt.md: {prompt_path}")
+        user_prompt = prompt_path.read_text(encoding="utf-8")
+        rows = db.execute(
+            "SELECT ID, Status, Summary, BaseCommitSHA, SquashCommitSHA "
+            "FROM Attempts ORDER BY ID DESC LIMIT 10"
+        ).fetchall()
+        total = db.execute("SELECT COUNT(*) FROM Attempts").fetchone()[0]
+        completed = db.execute(
+            "SELECT COUNT(*) FROM Attempts WHERE Status = 'completed'"
+        ).fetchone()[0]
+        readme_path = workspace / "reference" / "README.md"
+        if readme_path.is_file() and not readme_path.is_symlink():
+            reference_readme = readme_path.read_text(encoding="utf-8")
+        else:
+            reference_readme = "（缺少 reference/README.md）"
+
+        parts = [
+            "# Autotune Context",
+            "",
+            "## Best 相对初始 baseline",
+            "",
+            f"- best HEAD: `{best_head}`",
+            f"- baseline commit: `{baseline_sha}`",
+            f"- completed attempts: {completed} / total attempts: {total}",
+        ]
+        max_attempts = target.get("max_attempts")
+        if max_attempts is not None:
+            parts.append(f"- max_attempts: {max_attempts}")
+        parts.append("")
+        if best_head == baseline_sha and completed == 0:
+            parts.append("当前 best 仍为初始 baseline，尚无合入 Attempt。")
+            parts.append("")
+            for name, spec in target["metrics"].items():
+                parts.append(
+                    f"- `{name}` ({spec['direction']}, {spec['unit']}): "
+                    f"baseline = {baselines[name]:.6g}"
+                )
+        else:
+            parts.append(format_metric_changes(best_values, baselines, target))
+        parts.extend(["", "## User Prompt", "", user_prompt.rstrip(), ""])
+        parts.extend(["## Recent Attempts", ""])
+        if not rows:
+            parts.append("（尚无 Attempt）")
+            parts.append("")
+        else:
+            parts.append(f"最近 {len(rows)} 次（按 ID 降序，最多 10 次）：")
+            parts.append("")
+            for attempt_id, status, summary, base_sha, squash_sha in rows:
+                directory = workspace / "attempts" / f"attempt-{attempt_id:05d}"
+                parts.append(f"### attempt-{attempt_id:05d} ({status})")
+                parts.append("")
+                parts.append(f"- directory: `{directory}`")
+                parts.append(f"- BaseCommitSHA: `{base_sha}`")
+                if squash_sha:
+                    parts.append(f"- SquashCommitSHA: `{squash_sha}`")
+                parts.append(f"- summary: {summary if summary else '（无）'}")
+                metrics = attempt_metrics_map(db, attempt_id)
+                if metrics:
+                    parts.append("- metrics 相对初始 baseline:")
+                    parts.append(format_metric_changes(metrics, baselines, target))
+                else:
+                    parts.append("- metrics: （尚未记录）")
+                parts.append("")
+        parts.extend(["## Reference README", "", reference_readme.rstrip(), ""])
+        sys.stdout.write("\n".join(parts) + "\n")
+
+
+def complete_attempt(workspace, attempt_id, metrics, summary, details, fail=False,
+                     allow_regression=False):
     if attempt_id < 1:
         raise ValueError("Attempt ID 必须为正整数。")
     validate_metrics(metrics)
     if not summary.strip():
         raise ValueError("--summary 不能为空或仅包含空白。")
-    with open_workspace(workspace) as (workspace, best, db):
+    if fail and allow_regression:
+        raise ValueError("--allow-regression 不能与 --fail 同时使用")
+    with open_workspace(workspace) as (workspace, best, db, target):
+        require_target_metrics(metrics, target)
         db.execute("BEGIN IMMEDIATE")
         modified = False
         originals = {}
@@ -320,6 +724,8 @@ def complete_attempt(workspace, attempt_id, metrics, summary, details, fail=Fals
                                    if path.exists() else None)
             squash = None
             if not fail:
+                reference = reference_metrics(db, best, target)
+                check_pareto(metrics, reference, target, allow_regression)
                 repo = attempt / "repo"
                 check_worktree(repo, "Attempt repo")
                 # A same-looking commit in a separate repository is not this workspace's worktree.
@@ -399,10 +805,20 @@ def main():
     commands = parser.add_subparsers(dest="command")
     init = commands.add_parser(
         "init-workspace", help="从本地仓库 HEAD 初始化 workspace，从 stdin 读取用户原始请求",
-        description="从 stdin 读取完整 UTF-8 用户原始请求，不能为空或仅包含空白；原样保存到 user_prompt.md。",
+        description=(
+            "从 stdin 读取完整 UTF-8 用户原始请求，不能为空或仅包含空白；原样保存到 user_prompt.md。"
+            "必须提供 --baseline-meta 与至少一个 --metric NAME=VALUE；校验受保护文件 checksum，"
+            "写入 baseline_meta.json 与 target-metric.json。"
+        ),
     )
     init.add_argument("repo", help="本地 Git 仓库；不包含未提交修改")
     init.add_argument("workspace", help="不存在、为空或仅含 .autotune.lock 的 workspace 目录")
+    init.add_argument("--baseline-meta", required=True, metavar="PATH",
+                      help="baseline_meta.json 路径；会校验并复制到 workspace")
+    init.add_argument("--metric", required=True, action="append", metavar="NAME=VALUE",
+                      help="本次监控的 benchmark 指标及其 baseline 实测值；可重复，必须属于 meta.metrics.benchmark")
+    init.add_argument("--max-attempts", type=int, default=None, metavar="N",
+                      help="可选的调优循环次数上限，写入 target-metric.json")
     init.add_argument("--ref", nargs=3, action="append", default=[],
                       metavar=("URL", "REVISION", "NAME"),
                       help="参考仓库地址、分支/标签/提交 SHA、单层目录名；可重复，最多 8 个并行下载并递归初始化子模块")
@@ -411,15 +827,30 @@ def main():
         description="从 stdin 读取完整 plan 后等待 workspace 排他锁，再创建 Attempt。",
     )
     attempt.add_argument("workspace", help="已初始化的 workspace 目录")
+    context = commands.add_parser(
+        "get-context", help="输出规划用 Markdown 上下文到 stdout",
+        description=(
+            "在 workspace 锁下读取 best 相对初始 baseline 的指标变化、user_prompt.md、"
+            "最近 10 次 Attempt 的指标/summary/目录，以及 reference/README.md；格式化为 Markdown 写到 stdout。"
+        ),
+    )
+    context.add_argument("workspace", help="已初始化的 workspace 目录")
     complete = commands.add_parser(
         "complete-attempt", help="记录 Attempt 结果；默认成功并 squash，--fail 仅记录失败",
-        description="从 stdin 读取 UTF-8 detail 后获取 workspace 文件锁，写入数据库和 result.json/result.md。默认成功：要求双方干净且 best 未改变，并 squash 合入。--fail：仅记录失败，允许 best 已前进或 repo 有未提交修改。",
+        description=(
+            "从 stdin 读取 UTF-8 detail 后获取 workspace 文件锁，写入数据库和 result.json/result.md。"
+            "默认成功：要求 metric 恰好覆盖 target-metric、通过帕累托检查、双方干净且 best 未改变，并 squash 合入。"
+            "单指标 ≤1% 劣化且另有提升可通过；更差劣化需 --allow-regression。"
+            "--fail：仅记录失败，仍要求 metric 齐全，允许 best 已前进或 repo 有未提交修改。"
+        ),
     )
     complete.add_argument("workspace", help="已初始化的 workspace 目录")
     complete.add_argument("attempt_id", type=int, help="要结束的 running Attempt ID")
     complete.add_argument("--metric", required=True, metavar="JSON",
-                          help='指标名称到有限数值的非空 JSON 对象，例如 {"latency": 12, "throughput": 56}')
+                          help='指标名称到有限数值的非空 JSON 对象，键必须恰好等于 target-metric')
     complete.add_argument("--summary", required=True, help="非空的总结文本（不能仅包含空白）")
+    complete.add_argument("--allow-regression", action="store_true",
+                          help="显式允许合入存在超过 1% 劣化或多项小幅劣化的 Attempt")
     complete.add_argument("--fail", action="store_true", help="记录 failed，不 squash，也不检查 best 是否仍为起始 HEAD")
     args = parser.parse_args()
     if args.command is None:
@@ -428,16 +859,30 @@ def main():
     try:
         if args.command == "init-workspace":
             user_prompt = sys.stdin.buffer.read().decode("utf-8")
-            init_workspace(args.repo, args.workspace, args.ref, user_prompt)
+            baselines = {}
+            for item in args.metric:
+                name, value = parse_metric_baseline(item)
+                if name in baselines:
+                    raise ValueError(f"重复的 --metric 名称: {name}")
+                baselines[name] = value
+            init_workspace(
+                args.repo, args.workspace, args.ref, user_prompt,
+                Path(args.baseline_meta), baselines, args.max_attempts,
+            )
         elif args.command == "new-attempt":
             plan = sys.stdin.buffer.read().decode("utf-8")
             new_attempt(args.workspace, plan)
+        elif args.command == "get-context":
+            get_context(args.workspace)
         elif args.command == "complete-attempt":
             metrics = parse_metrics(args.metric)
             if not args.summary.strip():
                 raise ValueError("--summary 不能为空或仅包含空白。")
             details = sys.stdin.buffer.read().decode("utf-8")
-            complete_attempt(args.workspace, args.attempt_id, metrics, args.summary, details, fail=args.fail)
+            complete_attempt(
+                args.workspace, args.attempt_id, metrics, args.summary, details,
+                fail=args.fail, allow_regression=args.allow_regression,
+            )
     except (OSError, ValueError, RuntimeError, sqlite3.Error) as error:
         print(f"错误: {error}", file=sys.stderr)
         return 1

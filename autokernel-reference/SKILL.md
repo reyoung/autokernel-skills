@@ -7,7 +7,7 @@ description: >-
 
 # AutoKernel 参考项目
 
-按「要写的算子 + 目标架构 + 实现语言」检索下面的项目，克隆后阅读其核心 kernel 文件，再动手写实现。各条目列出的目录为该仓库内的相对路径。
+按「要写的算子 + 目标架构 + 实现语言」检索下面的项目。在 AutoKernel 流程中由 `init-workspace --ref` 下载到 workspace 的 `reference/`（revision 取上游 `main` 或 `master`），不要另克隆到别处。各条目列出的目录为该仓库内的相对路径。
 
 ## 算子库（生产级参考实现）
 

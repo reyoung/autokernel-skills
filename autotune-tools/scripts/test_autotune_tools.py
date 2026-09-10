@@ -1,6 +1,7 @@
 """Integration checks using temporary local Git repositories only."""
 
 from contextlib import redirect_stdout, redirect_stderr
+import hashlib
 import io
 import json
 import fcntl
@@ -24,6 +25,10 @@ DOWNLOAD = MODULE["download_references"]
 NEW = MODULE["new_attempt"]
 LOCK = MODULE["workspace_lock"]
 COMPLETE = MODULE["complete_attempt"]
+GET_CONTEXT = MODULE["get_context"]
+
+DEFAULT_BASELINES = {"latency": 20.0, "throughput": 50.0}
+DEFAULT_COMPLETE_METRICS = {"latency": 12.0, "throughput": 56.0}
 
 
 class RepositoryTestCase(unittest.TestCase):
@@ -42,6 +47,7 @@ class RepositoryTestCase(unittest.TestCase):
         self.env.start()
         self.addCleanup(self.env.stop)
         self.repo = self.make_repo("source")
+        self.meta_path = self.install_baseline_meta(self.repo)
         self.workspace = self.root / "workspace with spaces"
 
     def git(self, *args):
@@ -56,9 +62,56 @@ class RepositoryTestCase(unittest.TestCase):
         self.git("-C", repo, "commit", "-m", "initial")
         return repo
 
-    def init(self, refs=(), user_prompt="优化 kernel 的性能，保持正确性。"):
+    def install_baseline_meta(self, repo, benchmark_metrics=None):
+        benchmark_metrics = benchmark_metrics or {
+            "latency": {"unit": "ms", "direction": "minimize"},
+            "throughput": {"unit": "1/s", "direction": "maximize"},
+        }
+        script = repo / "eval" / "evaluate.py"
+        script.parent.mkdir(parents=True, exist_ok=True)
+        script.write_text("print('ok')\n", encoding="utf-8")
+        checksum = hashlib.sha256(script.read_bytes()).hexdigest()
+        meta = {
+            "schema_version": 1,
+            "protected_files": [{"path": "eval/evaluate.py", "checksum": checksum}],
+            "evaluation": {
+                "verify": {
+                    "script": "eval/evaluate.py",
+                    "command": ["python3", "eval/evaluate.py", "--mode", "verify"],
+                },
+                "benchmark": {
+                    "script": "eval/evaluate.py",
+                    "command": ["python3", "eval/evaluate.py", "--mode", "benchmark"],
+                },
+            },
+            "metrics": {
+                "verify": {"max_abs_error": {"unit": "1", "direction": "minimize"}},
+                "benchmark": benchmark_metrics,
+            },
+        }
+        path = repo / ".autokernel" / "baseline_meta.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+        self.git("-C", repo, "add", ".")
+        self.git("-C", repo, "commit", "-m", "baseline meta")
+        return path
+
+    def init(self, refs=(), user_prompt="优化 kernel 的性能，保持正确性。",
+             baselines=None, max_attempts=None, baseline_meta=None):
+        baselines = DEFAULT_BASELINES if baselines is None else baselines
         with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-            INIT(self.repo, self.workspace, refs, user_prompt)
+            INIT(self.repo, self.workspace, refs, user_prompt,
+                 Path(baseline_meta or self.meta_path), baselines, max_attempts)
+
+    def init_cli_args(self, workspace=None, baselines=None, max_attempts=None, meta=None):
+        baselines = DEFAULT_BASELINES if baselines is None else baselines
+        args = [str(CLI), "init-workspace", str(self.repo), str(workspace or self.workspace),
+                "--baseline-meta", str(meta or self.meta_path)]
+        for name, value in baselines.items():
+            args.extend(["--metric", f"{name}={value}"])
+        if max_attempts is not None:
+            args.extend(["--max-attempts", str(max_attempts)])
+        return args
 
     def worktrees(self):
         return self.git("-C", self.repo, "worktree", "list", "--porcelain")
@@ -82,6 +135,11 @@ class WorkspaceTests(RepositoryTestCase):
         self.assertEqual(before, self.git("-C", self.repo, "status", "--porcelain"))
         self.assertTrue((self.workspace / "attempts").is_dir())
         self.assertTrue((self.workspace / "reference").is_dir())
+        self.assertTrue((self.workspace / "baseline_meta.json").is_file())
+        target = json.loads((self.workspace / "target-metric.json").read_text(encoding="utf-8"))
+        self.assertEqual(target["metrics"]["latency"]["baseline"], 20.0)
+        self.assertEqual(target["metrics"]["throughput"]["direction"], "maximize")
+        self.assertNotIn("max_attempts", target)
         with sqlite3.connect(self.workspace / "autotune.db") as db:
             self.assertEqual(db.execute("SELECT COUNT(*) FROM Attempts").fetchone(), (0,))
             self.assertEqual(db.execute("SELECT COUNT(*) FROM Metrics").fetchone(), (0,))
@@ -183,15 +241,22 @@ class WorkspaceTests(RepositoryTestCase):
             result = subprocess.run([str(CLI), *args], capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("init-workspace", result.stdout)
-        result = subprocess.run([str(CLI), "init-workspace", str(self.root / "missing"),
-                                 str(self.workspace)], input="test", capture_output=True, text=True)
+        result = subprocess.run([str(CLI), "init-workspace", "--help"],
+                                capture_output=True, text=True)
+        self.assertIn("baseline-meta", result.stdout)
+        self.assertIn("max-attempts", result.stdout)
+        result = subprocess.run(
+            [str(CLI), "init-workspace", str(self.root / "missing"), str(self.workspace),
+             "--baseline-meta", str(self.meta_path), "--metric", "latency=1"],
+            input="test", capture_output=True, text=True,
+        )
         self.assertEqual(result.returncode, 1)
         self.assertFalse(self.workspace.exists())
 
     def test_initialization_saves_user_prompt_verbatim(self):
         prompt = "  优化 CUDA kernel\r\n约束：保持正确性，目标加速 2 倍。\n\n" * 10000
         result = subprocess.run(
-            [str(CLI), "init-workspace", str(self.repo), str(self.workspace)],
+            self.init_cli_args(),
             input=prompt.encode("utf-8"), capture_output=True,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -201,7 +266,7 @@ class WorkspaceTests(RepositoryTestCase):
         for prompt in ("", " \t\n"):
             with self.subTest(prompt=prompt):
                 result = subprocess.run(
-                    [str(CLI), "init-workspace", str(self.repo), str(self.workspace)],
+                    self.init_cli_args(),
                     input=prompt, capture_output=True, text=True,
                 )
                 self.assertNotEqual(result.returncode, 0)
@@ -209,6 +274,28 @@ class WorkspaceTests(RepositoryTestCase):
                 self.assertFalse(self.workspace.exists())
         with self.assertRaises(ValueError):
             self.init(user_prompt="")
+
+    def test_init_requires_meta_metrics_and_checksums(self):
+        with self.assertRaises(ValueError):
+            self.init(baselines={})
+        with self.assertRaisesRegex(ValueError, "不在 baseline meta"):
+            self.init(baselines={"missing": 1.0})
+        bad_meta = self.root / "bad-meta.json"
+        bad_meta.write_text(self.meta_path.read_text(encoding="utf-8").replace(
+            json.loads(self.meta_path.read_text(encoding="utf-8"))["protected_files"][0]["checksum"],
+            "0" * 64,
+        ), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "checksum"):
+            self.init(baseline_meta=bad_meta)
+        result = subprocess.run(
+            self.init_cli_args(max_attempts=3, baselines={"latency": 9.5}),
+            input="prompt", capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        target = json.loads((self.workspace / "target-metric.json").read_text(encoding="utf-8"))
+        self.assertEqual(set(target["metrics"]), {"latency"})
+        self.assertEqual(target["max_attempts"], 3)
+        self.assertEqual(target["metrics"]["latency"]["baseline"], 9.5)
 
 
 class InitializedWorkspaceTestCase(RepositoryTestCase):
@@ -275,7 +362,7 @@ class AttemptTests(InitializedWorkspaceTestCase):
         (repo / "content").write_text("better")
         self.git("-C", repo, "commit", "-am", "better")
         with redirect_stdout(io.StringIO()):
-            COMPLETE(self.workspace, 1, {"latency": 12}, "summary", "details")
+            COMPLETE(self.workspace, 1, DEFAULT_COMPLETE_METRICS, "summary", "details")
         self.new("next")
         next_repo = self.workspace / "attempts/attempt-00002/repo"
         self.assertEqual((next_repo / "content").read_text(), "better")
@@ -390,14 +477,24 @@ class AttemptTests(InitializedWorkspaceTestCase):
         other = self.root / "other-workspace"
         other.mkdir()
         with LOCK(other):
-            process = self.start_waiting_cli(["init-workspace", str(self.repo), str(other)],
-                                             plan=b"original prompt")
+            process = self.start_waiting_cli(
+                self.init_cli_args(workspace=other)[1:],
+                plan=b"original prompt",
+            )
             self.assertIsNone(process.poll())
             self.assertEqual([p.name for p in other.iterdir()], [".autotune.lock"])
         _, stderr = process.communicate(timeout=10)
         self.assertEqual(process.returncode, 0, stderr)
         self.assertTrue((other / "autotune.db").is_file())
         self.assertEqual((other / "user_prompt.md").read_text(), "original prompt")
+
+    def test_max_attempts_blocks_new_attempt(self):
+        other = self.root / "limited-workspace"
+        self.workspace = other
+        self.init(max_attempts=1)
+        self.new("only")
+        with self.assertRaisesRegex(ValueError, "max_attempts"):
+            self.new("blocked")
 
 
 class CompletionTests(InitializedWorkspaceTestCase):
@@ -411,14 +508,26 @@ class CompletionTests(InitializedWorkspaceTestCase):
         self.git("-C", repo, "commit", "-m", "second change")
         return repo
 
-    def complete(self, attempt_id=1, metrics=None, summary="summary", details="details", fail=False):
-        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-            COMPLETE(self.workspace, attempt_id, {"latency": 12} if metrics is None else metrics,
-                     summary, details, fail=fail)
+    def improving_metrics(self, attempt_id=1):
+        # Each successive completed Attempt must beat the previous best.
+        return {"latency": 12.0 - attempt_id, "throughput": 56.0 + attempt_id}
 
-    def complete_args(self, attempt_id=1):
-        return ["complete-attempt", str(self.workspace), str(attempt_id),
-                "--metric", '{"latency": 12, "throughput": 56}', "--summary", "summary"]
+    def complete(self, attempt_id=1, metrics=None, summary="summary", details="details",
+                 fail=False, allow_regression=False):
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            COMPLETE(self.workspace, attempt_id,
+                     self.improving_metrics(attempt_id) if metrics is None else metrics,
+                     summary, details, fail=fail, allow_regression=allow_regression)
+
+    def complete_args(self, attempt_id=1, metrics=None, allow_regression=False, fail=False):
+        metrics = self.improving_metrics(attempt_id) if metrics is None else metrics
+        args = ["complete-attempt", str(self.workspace), str(attempt_id),
+                "--metric", json.dumps(metrics), "--summary", "summary"]
+        if allow_regression:
+            args.append("--allow-regression")
+        if fail:
+            args.append("--fail")
+        return args
 
     def completion_row(self, attempt_id=1):
         with sqlite3.connect(self.workspace / "autotune.db") as db:
@@ -614,7 +723,7 @@ class CompletionTests(InitializedWorkspaceTestCase):
         with sqlite3.connect(self.workspace / "autotune.db") as db:
             db.execute("INSERT INTO Metrics (AttemptID, Name, Value) VALUES (1, 'old', 99)")
             db.execute("INSERT INTO Metrics (AttemptID, Name, Value) VALUES (2, 'keep', 100)")
-        metrics = {"latency": 12, "throughput": 56.5}
+        metrics = {"latency": 11.0, "throughput": 60.0}
         summary = "优化延迟，吞吐量提高"
         details = "第一行\r\n\n## 验证\n正确性通过。\n\n"
         result = subprocess.run(
@@ -740,7 +849,7 @@ class CompletionTests(InitializedWorkspaceTestCase):
             (target / "content").write_text("dirty content")
             (target / "untracked").write_text("untracked content")
         before = {target: self.git("-C", target, "status", "--porcelain") for target in (repo, best)}
-        result = subprocess.run([str(CLI), *self.complete_args(), "--fail"],
+        result = subprocess.run([str(CLI), *self.complete_args(fail=True)],
                                 input="失败详情\n", text=True, capture_output=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("failed", result.stdout)
@@ -752,7 +861,7 @@ class CompletionTests(InitializedWorkspaceTestCase):
             self.assertEqual((target / "untracked").read_text(), "untracked content")
         attempt = self.workspace / "attempts/attempt-00001"
         saved = json.loads((attempt / "result.json").read_text())
-        self.assertEqual(saved, {"status": "failed", "metrics": {"latency": 12, "throughput": 56},
+        self.assertEqual(saved, {"status": "failed", "metrics": self.improving_metrics(1),
                                  "summary": "summary", "details": "失败详情\n", "squash_commit_sha": None})
         self.assertIn("失败详情\n", (attempt / "result.md").read_text())
         with sqlite3.connect(self.workspace / "autotune.db") as db:
@@ -806,6 +915,55 @@ class CompletionTests(InitializedWorkspaceTestCase):
                 self.assertEqual(db.execute("SELECT Summary, Details FROM Attempts WHERE ID=1").fetchone(),
                                  (None, None))
         self.complete(fail=True)
+
+    def test_pareto_and_required_metrics(self):
+        self.candidate()
+        with self.assertRaisesRegex(ValueError, "恰好覆盖"):
+            self.complete(metrics={"latency": 10.0})
+        with self.assertRaisesRegex(ValueError, "提升"):
+            self.complete(metrics={"latency": 20.0, "throughput": 50.0})
+        # Single mild regression (<=1%) is ok when another metric improves.
+        self.complete(metrics={"latency": 20.1, "throughput": 60.0})
+        self.candidate(2)
+        # >1% regression requires --allow-regression.
+        with self.assertRaisesRegex(ValueError, "allow-regression"):
+            self.complete(2, metrics={"latency": 25.0, "throughput": 70.0})
+        self.complete(2, metrics={"latency": 25.0, "throughput": 70.0}, allow_regression=True)
+
+    def test_get_context_markdown(self):
+        (self.workspace / "reference" / "README.md").write_text(
+            "# Refs\n\nFlashAttention for tiling.\n", encoding="utf-8",
+        )
+        empty = io.StringIO()
+        with redirect_stdout(empty):
+            GET_CONTEXT(self.workspace)
+        text = empty.getvalue()
+        self.assertIn("# Autotune Context", text)
+        self.assertIn("## Best 相对初始 baseline", text)
+        self.assertIn("尚无合入 Attempt", text)
+        self.assertIn("## User Prompt", text)
+        self.assertIn("优化 kernel 的性能", text)
+        self.assertIn("## Recent Attempts", text)
+        self.assertIn("（尚无 Attempt）", text)
+        self.assertIn("## Reference README", text)
+        self.assertIn("FlashAttention for tiling.", text)
+        self.candidate()
+        self.complete()
+        self.candidate(2)
+        self.complete(2, fail=True)
+        result = subprocess.run(
+            [str(CLI), "get-context", str(self.workspace)],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("attempt-00002", result.stdout)
+        self.assertIn("attempt-00001", result.stdout)
+        self.assertIn("(completed)", result.stdout)
+        self.assertIn("(failed)", result.stdout)
+        self.assertIn("相对提升", result.stdout)
+        self.assertIn(str(self.workspace / "attempts/attempt-00001"), result.stdout)
+        # stdout must be markdown only: no CLI status chatter mixed in.
+        self.assertTrue(result.stdout.startswith("# Autotune Context\n"))
 
 
 if __name__ == "__main__":

@@ -1,3 +1,3 @@
 interface:
   display_name: "Tune Loop"
-  short_description: "执行 CUDA kernel 调优循环，验证候选、评测性能并记录尝试结果"
+  short_description: "按 baseline_meta 与 target-metric 跑调优循环并做帕累托合入"
