@@ -28,6 +28,7 @@ description: "与用户确定代码优化 baseline 的指标、正确性判据�
 - verify 和 benchmark 各自至少支持 1,000 个不同的 case，可复用同一套 case。通过不同输入、参数或边界条件形成覆盖；同一 case 的重复运行不计入数量。
 - 两者默认运行全量 case，支持参数选择（如 `--case-id 1,2,3`）和列举可用 ID（如 `--list-cases`，列举后退出）。case ID 稳定且唯一，无效选择明确报错；参数命名可沿用项目惯例。
 - 检查失败或选中的 case 未执行时返回非零退出码，并定位到指标和 case；不能丢弃失败样本后报告成功。
+- 构造 CUDA kernel baseline 时，读取并应用 [cuda-baseline-notes](../cuda-baseline-notes/SKILL.md) 正文。
 
 ## 生成与交付
 

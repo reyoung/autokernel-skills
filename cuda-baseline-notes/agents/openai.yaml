@@ -1,0 +1,3 @@
+interface:
+  display_name: "CUDA Baseline 注意事项"
+  short_description: "CUDA baseline 的计时、正确性与脚本耗时要求"
