@@ -1,0 +1,3 @@
+interface:
+  display_name: "autotune-tools"
+  short_description: "使用 bundled CLI 工具管理 autotune workspace"

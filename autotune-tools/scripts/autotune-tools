@@ -1,0 +1,247 @@
+#!/usr/bin/env python3
+"""CLI for autotune workspace management (Python standard library only)."""
+
+import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import closing, contextmanager
+import fcntl
+import os
+from pathlib import Path
+import shutil
+import sqlite3
+import subprocess
+import sys
+
+
+def git(*args):
+    result = subprocess.run(
+        ["git", *map(str, args)], capture_output=True, text=True,
+    )
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or result.stdout.strip())
+    return result.stdout.strip()
+
+
+LOCK_NAME = ".autotune.lock"
+
+
+@contextmanager
+def workspace_lock(workspace):
+    """All workspace writers must hold this persistent advisory lock."""
+    fd = os.open(workspace / LOCK_NAME, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def remove_worktree(repo, target):
+    registered = git("-C", repo, "worktree", "list", "--porcelain", "-z")
+    if f"worktree {target}" in registered.split("\0"):
+        git("-C", repo, "worktree", "remove", "--force", target)
+
+
+def check_empty_workspace(workspace):
+    if workspace.exists() and (
+        not workspace.is_dir()
+        or any(p.name != LOCK_NAME for p in workspace.iterdir())
+    ):
+        raise ValueError(f"workspace 必须不存在、为空或仅包含 {LOCK_NAME}: {workspace}")
+
+
+def create_database(path):
+    with closing(sqlite3.connect(path)) as db:
+        db.executescript("""
+            PRAGMA foreign_keys = ON;
+            CREATE TABLE Attempts (
+                ID INTEGER PRIMARY KEY AUTOINCREMENT,
+                Plan TEXT,
+                Status TEXT CHECK (Status IN ('running', 'completed', 'failed')),
+                Summary TEXT,
+                Details TEXT,
+                CreatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UpdatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE Metrics (
+                ID INTEGER PRIMARY KEY AUTOINCREMENT,
+                AttemptID INTEGER REFERENCES Attempts(ID),
+                Name TEXT,
+                Value REAL
+            );
+        """)
+
+
+def clone_reference(reference, root):
+    url, revision, name = reference
+    destination = root / name
+    print(f"[{name}] 开始下载", flush=True)
+    try:
+        git("clone", "--no-checkout", "--", url, destination)
+        # Remote branches may not have local branch names after cloning.
+        try:
+            commit = git("-C", destination, "rev-parse", "--verify",
+                         "--end-of-options", f"{revision}^{{commit}}")
+        except RuntimeError:
+            commit = git("-C", destination, "rev-parse", "--verify",
+                         "--end-of-options", f"refs/remotes/origin/{revision}^{{commit}}")
+        git("-C", destination, "checkout", "--detach", commit)
+        git("-C", destination, "submodule", "update", "--init", "--recursive")
+    except (OSError, RuntimeError) as error:
+        raise RuntimeError(f"[{name}] 下载失败: {error}") from error
+    print(f"[{name}] 下载完成 ({commit})", flush=True)
+
+
+def download_references(references, root):
+    if not references:
+        return
+    errors = []
+    with ThreadPoolExecutor(max_workers=min(8, len(references))) as executor:
+        futures = [executor.submit(clone_reference, ref, root) for ref in references]
+        for future in as_completed(futures):
+            try:
+                future.result()
+            except (OSError, RuntimeError) as error:
+                print(str(error), file=sys.stderr, flush=True)
+                errors.append(str(error))
+    if errors:
+        raise RuntimeError("参考仓库初始化失败:\n" + "\n".join(errors))
+
+
+def init_workspace(repo, workspace, references):
+    repo = Path(repo).resolve()
+    workspace = Path(workspace).absolute()
+    if not repo.is_dir():
+        raise ValueError(f"本地仓库目录不存在: {repo}")
+    commit = git("-C", repo, "rev-parse", "--verify", "HEAD^{commit}")
+    if workspace.is_symlink():
+        raise ValueError(f"workspace 不能是软链接: {workspace}")
+    workspace = workspace.resolve()
+    check_empty_workspace(workspace)
+    names = set()
+    for url, revision, name in references:
+        if (not url or not revision or not name or name in (".", "..")
+                or "/" in name or "\\" in name or name in names):
+            raise ValueError(f"无效或重复的参考仓库目录名（地址和版本也不能为空）: {name!r}")
+        names.add(name)
+
+    workspace.mkdir(parents=True, exist_ok=True)
+    with workspace_lock(workspace):
+        check_empty_workspace(workspace)
+        baseline = workspace / "baseline"
+        try:
+            git("-C", repo, "worktree", "add", "--detach", baseline, commit)
+            (workspace / "best").symlink_to("baseline", target_is_directory=True)
+            create_database(workspace / "autotune.db")
+            (workspace / "reference").mkdir()
+            (workspace / "attempts").mkdir()
+            download_references(references, workspace / "reference")
+        except BaseException:
+            # The executor has finished before cleanup, so no clone can recreate files.
+            try:
+                remove_worktree(repo, baseline)
+            except (OSError, RuntimeError) as error:
+                print(f"清理 worktree 失败，保留 workspace {workspace}: {error}",
+                      file=sys.stderr)
+                raise
+            try:
+                for name in ("baseline", "best", "autotune.db", "reference", "attempts"):
+                    path = workspace / name
+                    if path.is_symlink() or path.is_file():
+                        path.unlink()
+                    elif path.is_dir():
+                        shutil.rmtree(path)
+            except OSError as error:
+                print(f"清理失败，残留位置 {workspace}: {error}", file=sys.stderr)
+            raise
+    print(f"Workspace 初始化完成: {workspace}")
+
+
+def new_attempt(workspace, plan):
+    if not plan.strip():
+        raise ValueError("plan 不能为空或仅包含空白。")
+    workspace = Path(workspace).resolve()
+    if not workspace.is_dir():
+        raise ValueError(f"workspace 目录不存在: {workspace}")
+    with workspace_lock(workspace):
+        database = workspace / "autotune.db"
+        attempts = workspace / "attempts"
+        best_link = workspace / "best"
+        if (not database.is_file() or database.is_symlink()
+                or not attempts.is_dir() or attempts.is_symlink()
+                or not best_link.is_symlink()):
+            raise ValueError(f"无效的 workspace（需要 autotune.db、attempts/ 和 best 软链接）: {workspace}")
+        best = best_link.resolve(strict=True)
+        top = Path(git("-C", best, "rev-parse", "--show-toplevel")).resolve()
+        if top != best:
+            raise ValueError(f"best 必须指向 Git worktree 根目录: {best}")
+        if git("-C", best, "status", "--porcelain", "--untracked-files=all",
+               "--ignore-submodules=none"):
+            raise ValueError(f"best 含有未提交或未跟踪的修改，请先提交或清理: {best}")
+        commit = git("-C", best, "rev-parse", "--verify", "HEAD^{commit}")
+        with closing(sqlite3.connect(database.as_uri() + "?mode=rw", uri=True)) as db:
+            db.execute("PRAGMA foreign_keys = ON")
+            db.execute("BEGIN IMMEDIATE")
+            created = False
+            attempt = None
+            try:
+                cursor = db.execute(
+                    "INSERT INTO Attempts (Plan, Status) VALUES (?, 'running')", (plan,)
+                )
+                attempt_id = cursor.lastrowid
+                attempt = attempts / f"attempt-{attempt_id:05d}"
+                attempt.mkdir()
+                created = True
+                (attempt / "plan.md").write_bytes(plan.encode("utf-8"))
+                git("-C", best, "worktree", "add", "--detach", attempt / "repo", commit)
+                db.commit()
+            except BaseException:
+                try:
+                    db.rollback()
+                finally:
+                    if created:
+                        try:
+                            remove_worktree(best, attempt / "repo")
+                            shutil.rmtree(attempt)
+                        except (OSError, RuntimeError) as error:
+                            print(f"清理失败，残留位置 {attempt}: {error}", file=sys.stderr)
+                raise
+    print(f"Attempt {attempt_id} 创建完成: {attempt}")
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="autotune-tools", description="管理 autotune workspace。")
+    commands = parser.add_subparsers(dest="command")
+    init = commands.add_parser("init-workspace", help="从本地仓库 HEAD 初始化 workspace")
+    init.add_argument("repo", help="本地 Git 仓库；不包含未提交修改")
+    init.add_argument("workspace", help="不存在、为空或仅含 .autotune.lock 的 workspace 目录")
+    init.add_argument("--ref", nargs=3, action="append", default=[],
+                      metavar=("URL", "REVISION", "NAME"),
+                      help="参考仓库地址、分支/标签/提交 SHA、单层目录名；可重复，最多 8 个并行下载并递归初始化子模块")
+    attempt = commands.add_parser(
+        "new-attempt", help="从干净的 best 创建一个 Attempt，从 stdin 读取 UTF-8 plan",
+        description="从 stdin 读取完整 plan 后等待 workspace 排他锁，再创建 Attempt。",
+    )
+    attempt.add_argument("workspace", help="已初始化的 workspace 目录")
+    args = parser.parse_args()
+    if args.command is None:
+        parser.print_help()
+        return 0
+    try:
+        if args.command == "init-workspace":
+            init_workspace(args.repo, args.workspace, args.ref)
+        elif args.command == "new-attempt":
+            plan = sys.stdin.buffer.read().decode("utf-8")
+            new_attempt(args.workspace, plan)
+    except (OSError, ValueError, RuntimeError, sqlite3.Error) as error:
+        print(f"错误: {error}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("已取消操作。", file=sys.stderr)
+        return 130
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
