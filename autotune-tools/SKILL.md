@@ -30,6 +30,7 @@ description: 使用 bundled CLI autotune-tools 管理 autotune workspace 时使�
 
 - `new-attempt`：从 best 创建候选；若 `target-metric.json` 含 `max_attempts` 且 Attempt 总数已达上限则拒绝。
 - `complete-attempt`：必须传入恰好覆盖 `target-metric` 全部键的 `--metric` JSON、非空 `--summary`，stdin 读 detail。
+  - `--summary` 须简述本次 Attempt 实际采用或尝试的优化方法，以及选择该方法的动机（针对的瓶颈、预期减少的开销或改善的指标）。方法与动机写在 summary 本身，便于后续 `get-context` 直接读取。例如：`--summary '融合归一化与输出转换，针对中间张量读写和多次 kernel launch 的开销，尝试减少显存访问与启动次数。'`
   - 默认成功：相对当前 best 的参考指标做帕累托检查后 squash 合入。参考指标取「SquashCommitSHA == best HEAD」的最近一次 completed Attempt；若尚无合入则用 `target-metric` 中的 baseline 值。
   - 至少一个监控指标必须提升。允许至多一个指标相对劣化 ≤1%，且同时另有指标提升。更差或多项劣化需加 `--allow-regression`。
   - `--fail` 仅记录失败，仍要求 metric 齐全；允许 best 已前进。成功合入要求双方干净且 best 未偏离候选起始提交。

@@ -44,6 +44,8 @@ workspace/
 
 ## 优化 Attempt
 
+每次结束 Attempt 时，`summary` 须简述本次实际采用或尝试的优化方法及动机，成功和失败均适用；填写要求与示例见 [autotune-tools](../autotune-tools/SKILL.md#new-attempt--complete-attempt)。
+
 1. 若 `target-metric.json` 已达 `max_attempts`，停止循环。
 2. **生成 plan 之前**必须运行 `autotune-tools get-context <workspace>`，根据 stdout 的 Markdown（workspace 绝对路径与目录结构、best 相对 baseline、user prompt、近 10 次 Attempt、reference README）撰写计划；不可凭记忆跳过。计划须写明拟借鉴的参考项目/技术点，以及预期影响的监控指标。
 3. 将计划 stdin 传给 `new-attempt <workspace>`。

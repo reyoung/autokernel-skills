@@ -874,9 +874,10 @@ def main():
     complete.add_argument("attempt_id", type=int, help="要结束的 running Attempt ID")
     complete.add_argument("--metric", required=True, metavar="JSON",
                           help='指标名称到有限数值的非空 JSON 对象，键必须恰好等于 target-metric')
-    complete.add_argument("--summary", required=True, help="非空的总结文本（不能仅包含空白）")
+    complete.add_argument("--summary", required=True,
+                          help="简述本次 Attempt 实际采用或尝试的优化方法及动机（成功/失败均需，不能为空或仅含空白）")
     complete.add_argument("--allow-regression", action="store_true",
-                          help="显式允许合入存在超过 1% 劣化或多项小幅劣化的 Attempt")
+                          help="显式允许合入存在超过 1%% 劣化或多项小幅劣化的 Attempt")
     complete.add_argument("--fail", action="store_true", help="记录 failed，不 squash，也不检查 best 是否仍为起始 HEAD")
     args = parser.parse_args()
     if args.command is None:
