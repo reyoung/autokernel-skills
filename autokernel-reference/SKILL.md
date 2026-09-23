@@ -21,6 +21,11 @@ https://github.com/deepseek-ai/FlashMLA
 
 DeepSeek V3/V4 的 Multi-head Latent Attention 内核库，CUDA C++ + CuTe + CUTLASS cluster launch，按稀疏/稠密 × prefill/decode 分成四条主线，编译期 `.cu` 实例化而非 JIT。SM90 decode 的范式：split-KV 主 kernel + combine kernel（PDL grid 同步合并 LSE）、FP8 KV tile 反量化、2-CTA cluster crossover（分布式共享内存 `st.async` 交换）、persistent 变体。SM100 用 TMEM/UTCMMA 做 Copy/MMA/Softmax 三级流水的稀疏 prefill，并有 norm+RoPE+attn+cast 融合超核。长上下文 decode、稀疏 top-k attention、paged FP8/FP4 KV 布局的首选参考。入口：`csrc/kernels/sm90/decode/`、`csrc/kerutils/`、`docs/` 下的 deep-dive 文档。
 
+### MSA（MiniMax Sparse Attention）
+https://github.com/MiniMax-AI/MSA/tree/main
+
+MiniMax 面向 Blackwell（SM100）的 sparse attention 推理实现，CUDA C++/CuTe + CuTe-DSL。核心参考是 KV-major 稀疏 prefill：将 Q→Top-K 块索引反转为 K→Q CSR，按 KV 块 gather Q、复用 K/V，切分高负载 CSR 行，再用 partial O/LSE + combine 合并结果。可借鉴 TMA gather4、tcgen05/TMEM、warp specialization 与分段 P→PV 流水；另有原生 FP4 block-score indexer、直方图 Top-16 筛选与 warp bitonic 排序。NVFP4 KV 在计算前反量化为 BF16/FP8；稀疏 decode 走 C++ 路径，CuTe paged FP8 decode 当前仅支持全量 KV。入口：`python/fmha_sm100/cute/src/sm100/`（prefill、FP4 indexer、decode）、`python/fmha_sm100/csrc/include/`（FMHA、Top-K）；具体调用链、适用边界与 benchmark 范围见 [MSA 源码导读](references/msa-source-notes.md)。
+
 ### FlashInfer
 https://github.com/flashinfer-ai/flashinfer
 
@@ -66,3 +71,4 @@ https://github.com/xlite-dev/LeetCUDA
 - CuTe / CuteDSL：CUTLASS 是基础设施，QuACK、FlashAttention（FA4）是可直接对照的生产代码。
 - DSL 快速迭代：通用融合算子用 Triton；显式 tile GEMM/attention 流水、TMA/warp specialization、跨厂商移植用 TileLang。
 - Serving 侧工程结构（paged KV、JIT 特化、plan-run、多后端 dispatch）：FlashInfer。
+- Blackwell（SM100）的 sparse attention 推理优化：MSA。
