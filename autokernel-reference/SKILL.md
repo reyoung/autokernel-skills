@@ -7,7 +7,7 @@ description: >-
 
 # AutoKernel 参考项目
 
-按「要写的算子 + 目标架构 + 实现语言」检索下面的项目。在 AutoKernel 流程中由 `init-workspace --ref` 下载到 workspace 的 `reference/`（revision 取上游 `main` 或 `master`），不要另克隆到别处。各条目列出的目录为该仓库内的相对路径。
+按「要写的算子 + 目标架构 + 实现语言」检索下面的项目。在 AutoKernel 流程中由 `init-workspace --ref` 下载到 workspace 的 `reference/`（revision 取上游实际默认分支，如 `main`、`master` 或 `develop`），不要另克隆到别处。各条目列出的目录为该仓库内的相对路径。
 
 ## 算子库（生产级参考实现）
 
@@ -46,6 +46,11 @@ https://github.com/NVIDIA/cutlass
 
 NVIDIA 官方 GEMM/线性代数模板库，也是 CuTe 与 CuteDSL 的上游，FlashAttention-4、QuACK、FlashInfer 都建在其上。三层接口：CUTLASS 3.x C++ collective（`include/cutlass/gemm/collective/`，mainloop + epilogue 组合）、CuTe C++ 的 layout/tensor 代数（`include/cute/`）、CuteDSL Python（`examples/python/CuTeDSL/`）。技术栈覆盖分层 tiling（thread/warp/warpgroup/CTA/cluster）、TMA async copy 与 multicast、Hopper WGMMA、Blackwell tcgen05 + TMEM、persistent/CLC tile scheduler、warp specialization、blockscaled NVFP4/MXFP8、mbarrier pipeline。写 Tensor Core kernel 时先读 CuteDSL 的 TMA/MMA/softmax primitives 教程与 `hopper/dense_gemm.py`。注意需按 `90a`/`100a` 编译，SM100 与 SM120 二进制不通用。
 
+### cuDNN Frontend
+https://github.com/NVIDIA/cudnn-frontend
+
+NVIDIA 官方 cuDNN Graph 前端与开源 kernel 集合。CuTe-DSL 重点看 `python/cudnn/gemm/cutedsl/` 的 dense/grouped GEMM + SwiGLU/量化（MoE 可变 M），以及 `python/cudnn/block_sparse_attention/` 的稀疏 attention；可借鉴 Blackwell 的 TMA、tcgen05/TMEM、warp specialization、persistent/CLC 调度与融合 epilogue。CUDA C++ 入口是 `include/cudnn_frontend/generated/rms_norm_silu/`，以字符串内嵌 kernel，由 `include/cudnn_frontend/experimental/` 的 NVRTC 引擎编译，融合 RMSNorm + SiLU 与 FP8/NVFP4 输出量化，含向量化访存、归约和按 shape 选 knob。`include/cudnn_frontend/graph_interface.h` 展示这些引擎与 cuDNN 后端执行计划的整合。默认分支 `develop`；具体实现与适用边界见 [cuDNN Frontend 源码导读](references/cudnn-frontend-source-notes.md)。
+
 ## Kernel DSL
 
 ### TileLang
@@ -72,3 +77,4 @@ https://github.com/xlite-dev/LeetCUDA
 - DSL 快速迭代：通用融合算子用 Triton；显式 tile GEMM/attention 流水、TMA/warp specialization、跨厂商移植用 TileLang。
 - Serving 侧工程结构（paged KV、JIT 特化、plan-run、多后端 dispatch）：FlashInfer。
 - Blackwell（SM100）的 sparse attention 推理优化：MSA。
+- NVIDIA 官方的 GEMM/MoE 融合、block-sparse attention 与 C++/NVRTC RMSNorm + SiLU：cuDNN Frontend。
